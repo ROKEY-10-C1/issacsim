@@ -63,16 +63,20 @@ class RobotEnvTask(BaseTask):
     # 언제: world.get_observations() 를 부를 때
     # 돌려줄 값: {물체 이름: {값 이름: 값}}
     def get_observations(self):
-        return {self._robot.name: {"joint_positions": self._robot.get_joint_positions()}}
-    def get_observations_cube(self):
-        return {self.cube.name: {"cube_positions": self.cube.get_world_positions()}}
+        cube_position, _ = self.cube.get_world_pose()
+
+        return {
+            self._robot.name: {"joint_positions": self._robot.get_joint_positions()},
+            self.cube.name: {"position": cube_position}
+        }
 
     # 언제: 메인 루프가 물체 이름을 알아낼 때 (task.get_params())
     # 돌려줄 값: {파라미터 이름: {"value": 값}}
     def get_params(self):
-        return {"robot_name": {"value": self._robot.name}}
-    def get_params_cube(self):
-        return {"cube_name": {"value": self.cube.name}}
+        return {
+            "robot_name": {"value": self._robot.name},
+            "cube_name": {"value": self.cube.name}
+        }
 
 
 # ------------------------------------------------------------
@@ -95,13 +99,12 @@ class SwingController(BaseController):
 
     # 언제: 매 프레임 메인 루프가 부른다
     # 받는 값: 팔 관절 6개의 지금 각도 (rad) / 돌려줄 값: ArticulationAction
-    def forward(self, current_arm):
-        # 1) 도착 판정: 도착하면 목표를 반대쪽으로
+    def forward(self, current_arm, cube_position):
         joint_1_deg = np.degrees(current_arm[0])
-        cube_position, cube_orientation = cube.get_world_pose()
-        
-        self.goal_deg = np.degrees(math.atan2(cube_position[1], cube_position[0])
-)
+
+        self.goal_deg = np.degrees(math.atan2(cube_position[1], cube_position[0]))
+
+        self.arrived = abs(joint_1_deg - self.goal_deg) < TOLERANCE_DEG
         # 2) 목표 자세: 홈 자세에서 joint_1 만 goal_deg
         goal_arm = np.radians(HOME_DEG)
         goal_arm[0] = np.radians(self.goal_deg)
@@ -122,10 +125,9 @@ task = RobotEnvTask(name="robot_env")
 world.add_task(task)
 world.reset()  # 여기서 task.set_up_scene() -> task.post_reset() 이 불린다
 
-robot_name = task.get_params()["robot_name"]["value"]  # 이름은 Task 에게 물어본다
-cube_name = task.get_params_cube()["cube_name"]["value"]
+robot_name = task.get_params()["robot_name"]["value"]
+cube_name = task.get_params()["cube_name"]["value"]
 robot = world.scene.get_object(robot_name)
-cube = world.scene.get_object(cube_name)
 
 arm = [robot.get_dof_index(name) for name in ARM_JOINTS]
 controller = SwingController("swing_controller", arm_indices=arm)
@@ -155,8 +157,11 @@ while simulation_app.is_running():
         # 3) 관측 (Task)
         observations = world.get_observations()
         current_arm = observations[robot_name]["joint_positions"][arm]
+        cube_position = observations[cube_name]["position"]
+
         # 4) 계산 (Controller)
-        action = controller.forward(current_arm)
+        action = controller.forward(current_arm, cube_position)
+
         # 5) 명령
         robot.apply_action(action)
 
