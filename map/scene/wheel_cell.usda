@@ -1,0 +1,55 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    endTimeCode = 12518.272115358726
+    framesPerSecond = 24
+    metersPerUnit = 1
+    startTimeCode = 0
+    subLayers = [
+        @./overrides/environment.usda@,
+        @./overrides/factory.usda@,
+        @./overrides/orders.usda@,
+        @./overrides/shared.usda@,
+        @./shared/asset_library.usdc@,
+        @./shared/materials.usdc@,
+        @./environment/lighting_cameras.usdc@,
+        @./factory/building.usdc@,
+        @./factory/conveyor.usdc@,
+        @./factory/floor.usdc@,
+        @./factory/robot_rails.usdc@,
+        @./factory/safety.usdc@,
+        @./factory/truck.usdc@,
+        @./factory/vehicle_buffers.usdc@,
+        @./orders/CN7_001.usdc@,
+        @./orders/CN7_002.usdc@,
+        @./orders/CN7_003.usdc@,
+        @./orders/CN7_004.usdc@
+    ]
+    timeCodesPerSecond = 24
+    upAxis = "Z"
+)
+
+def Xform "World"
+{
+    custom double cell:bodyLengthM = 4.71
+    custom double cell:bodyWidthM = 1.825
+    custom double cell:hubPilotDiameterM = 0.06694
+    custom double cell:lugThroatM = 0.0134
+    custom double cell:maxNutTorqueNm = 127
+    custom double cell:minNutTorqueNm = 107
+    custom double cell:studDiameterM = 0.012
+    custom double cell:studPitchM = 0.0015
+    custom double cell:studProjectionM = 0.03
+    custom double cell:wheelbaseM = 2.72
+    double3 xformOp:translate = (0, 0, 0)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+
+    def "Factory"
+    {
+    }
+
+    def Scope "Orders"
+    {
+    }
+}
+
