@@ -42,7 +42,7 @@ def main():
     parser.set_defaults(camera="Overview")
     parser.add_argument("--replay", action="store_true", help="Use the original timeline preview")
     parser.add_argument("--seed", type=int, help="Reproduce the wheel arrival angles")
-    parser.add_argument("--jam", action="store_true", help="Inject a 2 mm FL guide offset in live mode")
+    parser.add_argument("--jam", action="store_true", help="Inject a 6 mm FL guide offset in live mode")
     parser.add_argument("--start-at", type=float, default=None, metavar="SECONDS",
                         help="Seek to this scene time when starting")
     parser.add_argument("--quality", choices=("balanced", "high", "cinematic"), default="high")

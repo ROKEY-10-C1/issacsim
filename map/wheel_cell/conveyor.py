@@ -5,7 +5,7 @@ from math import atan2, degrees
 from pxr import Gf, PhysxSchema, UsdGeom, UsdPhysics, UsdShade
 
 from physical_data import JAW_STROKE, ROLLER_RADIUS, ROLLER_RATED_SPEED, ROLLER_TORQUE, tube_properties
-from process import BELT_Z, CN7_R16, LINE_Y, REJECT_GATE_HALF, REJECT_X
+from process import BELT_Z, CN7_R16, LINE_Y, REJECT_GATE_HALF, REJECT_X, SPLIT_X
 
 FACTORY="/World/Factory"
 START_AHEAD=.76
@@ -110,6 +110,20 @@ def setup_factory(stage, root, material, guide_material, branch_side):
                       "TruckCargo","TruckCab","TruckFrame") or (
                 "Guard" in main and name.startswith(("Stile_","Header_"))):
             collider(prim)
+    # Without these the 632 mm tire spans a 350 mm unsupported gap between the diverter
+    # and the first bend roller, and tips into it.
+    for side,label in ((1,"Left"),(-1,"Right")):
+        for i,(t,length) in enumerate(((.4375,.36),(.4700,.48))):
+            path=f"{root}/Conveyor/{label}BendInfeed_{i}"
+            roll=UsdGeom.Cylinder.Define(stage,path)
+            roll.CreateAxisAttr("Y")
+            roll.CreateRadiusAttr(ROLLER_RADIUS)
+            roll.CreateHeightAttr(length)
+            roll.AddTranslateOp().Set(Gf.Vec3d(SPLIT_X-2.14*t,side*LINE_Y*t*t*(3-2*t),BELT_Z-ROLLER_RADIUS))
+            roll.AddRotateZOp().Set(degrees(atan2(side*LINE_Y*6*t*(1-t),-2.14)))
+            roll.CreateDisplayColorAttr([(.36,.40,.42)])
+            # Local +X points downstream, and a positive rate conveys along +X.
+            powered_roller(roll,path+"_Axle",.28,material,UsdGeom.XformCache())
     for side,label in ((1,"Left"),(-1,"Right")):
         for i,(x0,x1) in enumerate(((-1.04,1.04),(1.68,4.71))):
             for edge in (-1,1):
@@ -247,12 +261,13 @@ class Transfer:
         if self.return_time is None or self.return_time>=4.75:
             return
         self.return_time+=dt
-        # Withdraw away from the spindle before swinging the open jaw beam.
-        outbound=progress(self.return_time,.80,.75)
-        raised=progress(self.return_time,1.55,.50)
-        retreat=progress(self.return_time,2.10,.85)
-        straighten=progress(self.return_time,3.05,.95)
-        lower=progress(self.return_time,4.05,.65)
+        # Slide the open jaws off along the tread first: the chuck now occupies the space
+        # outboard of the wheel. Then clear the car before swinging the beam.
+        retreat=progress(self.return_time,.45,1.00)
+        outbound=progress(self.return_time,1.50,.55)
+        raised=progress(self.return_time,2.05,.55)
+        straighten=progress(self.return_time,2.75,1.10)
+        lower=progress(self.return_time,3.95,.65)
         parked_y=self.side*(LINE_Y+.24)
         point=self.return_start+Gf.Vec3d(
             (self.origin[0]+.46-self.return_start[0])*retreat,

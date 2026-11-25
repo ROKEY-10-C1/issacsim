@@ -1,7 +1,7 @@
 """Live, docked four-corner PhysX assembly with encoder-driven wheel alignment."""
 
 from dataclasses import dataclass
-from math import atan2, cos, degrees, sin, sqrt, tau
+from math import atan2, cos, degrees, pi, radians, sin, sqrt, tau
 from pathlib import Path
 from random import Random
 import xml.etree.ElementTree as ET
@@ -9,10 +9,14 @@ import xml.etree.ElementTree as ET
 import numpy as np
 from pxr import Gf, PhysicsSchemaTools, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, UsdShade, UsdUtils
 
+from chuck import JAWS, RETRACT, Chuck, rim_sections
 from conveyor import START_AHEAD, TREAD_HALF, Transfer, collider, quaternion, setup_factory, station_hardware
-from fitment import ARCH_RADIUS, BOLT_CENTERS, FLANGE_RADIUS, OFFSET, PILOT, PILOT_LENGTH, STUD_DIAMETER
-from fitment import STUD_PROJECTION, WHEEL_MASS, half_track
+from fitment import ARCH_RADIUS, BOLT_CENTERS, BORE, CENTER_WEB_RADIUS, FLANGE_RADIUS, LUG_HOLE, OFFSET, PILOT, PILOT_LENGTH, STUD_DIAMETER
+from fitment import STUD_PROJECTION, WEB_THICKNESS, WHEEL_MASS, half_track
 from physical_data import BODY_MASS, JAW_FORCE, JAW_STROKE, PAD_DYNAMIC_FRICTION, PAD_STATIC_FRICTION
+from physical_data import ANGLE_NOISE, FRICTION_SCATTER, GRAVITY, IMBALANCE, MASS_SCATTER
+from physical_data import PILOT_LEAD, STUD_LEAD, TIRE_CONTACT_POINTS, TIRE_DAMPING_RATIO, TIRE_STIFFNESS
+from physical_data import AMR_ROLLING_RESISTANCE, CHUCK_PAD_DAMPING, CHUCK_PAD_STIFFNESS
 from physical_data import CAMERA_MASS, CAMERA_SIZE, box_inertia, servo_damping, wheel_inertia
 from physical_data import GUIDE_DYNAMIC_FRICTION, GUIDE_STATIC_FRICTION
 from physical_data import AMR_ACCELERATION, AMR_LIFT_MASS, AMR_LIFT_SPEED, AMR_MASS, AMR_PAYLOAD, AMR_SIZE
@@ -22,7 +26,7 @@ from process import BELT_Z, CN7_R16, HUB_Z, LINE_Y, RAIL_Y, STATIONS
 
 ROOT = "/World/Live"
 REFERENCE = "/World/Orders/CN7_001"
-HZ = 240
+HZ = 480                           # 240 Hz overstates jaw slip tenfold during insertion
 ALIGN_TOL = .12                    # degrees, as measured by the simulated encoder
 FEED_STROKE = .060
 SEAT_TOL = .0007                   # numerical seating tolerance, not a production tolerance
@@ -31,7 +35,10 @@ DOCK_READY = 35.
 SOURCE_POSE = 30.5                # seconds on the mechanical preview stage
 MIN_RAIL_SPACING = 1.55           # meters between carriage origins, including braking clearance
 TERMINAL_PHASES = frozenset(("seated","jammed","alignment_failed","feed_failed","clamp_failed",
-                             "grip_slip","tip_failed","interference","dock_lost"))
+                             "grip_slip","tip_failed","chuck_failed","interference","dock_lost"))
+WEB_LAND = .0450                  # radius separating the bore land from the lug-hole cells
+BORE_CHAMFER = .001
+JAM_OFFSET = .006                  # beyond the chamfer and compliance capture range
 
 
 def vec(v):
@@ -69,7 +76,14 @@ def body(stage, path, pos, orientation, mass, kinematic=False):
     UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(mass)
     options = PhysxSchema.PhysxRigidBodyAPI.Apply(prim)
     options.CreateSolverPositionIterationCountAttr(64)
-    options.CreateSolverVelocityIterationCountAttr(8)
+    options.CreateSolverVelocityIterationCountAttr(4)
+    # PhysX adds .05 1/s of artificial angular drag unless this is cleared.
+    options.CreateAngularDampingAttr(0.)
+    options.CreateLinearDampingAttr(0.)
+    options.CreateMaxDepenetrationVelocityAttr(.5)
+    # A loaded contact must keep reporting force; real parts do not go to sleep.
+    options.CreateSleepThresholdAttr(0.)
+    options.CreateStabilizationThresholdAttr(0.)
     return prim
 
 
@@ -143,6 +157,17 @@ def pin(stage, path, xy, z0, length, radius, material):
     return shape
 
 
+def tapered_pin(stage,path,xy,z0,length,radius,lead,material):
+    """Round pin with the chamfered nose that lets a real hub find the bore."""
+    height,reduction=lead
+    pin(stage,path,xy,z0,length-height,radius,material)
+    n=48
+    ring=[(cos(i*tau/n),sin(i*tau/n)) for i in range(n)]
+    base=z0+length-height
+    points=[Gf.Vec3f(xy[0]+r*x,xy[1]+r*y,z) for r,z in ((radius,base),(radius-reduction,base+height)) for x,y in ring]
+    convex_prism(stage,path+"_Lead",points,n,True,material)
+
+
 def hull(stage, path, outline, z0, z1, precise, material=None):
     n = len(outline)
     pts = [Gf.Vec3f(x,y,z) for z in (z0,z1) for x,y in outline]
@@ -184,31 +209,67 @@ def drive(joint, axis, target, stiffness, damping, force):
     return api.CreateTargetPositionAttr(target)
 
 
-def collision_web(stage):
-    """Use only mounting-face triangles, keeping the six apertures open on CPU."""
-    web=UsdGeom.Mesh(stage.GetPrimAtPath("/AssetLibrary/Wheel_16/CenterWeb"))
-    coords=web.GetPointsAttr().Get()
-    cursor=0
-    result=[]
-    indices=web.GetFaceVertexIndicesAttr().Get()
-    for n in web.GetFaceVertexCountsAttr().Get():
-        face=[coords[j] for j in indices[cursor:cursor+n]]
-        cursor+=n
-        if n==3 and all(abs(p[2]-OFFSET)<1e-6 for p in face):
-            result.append([(p[0],p[1]) for p in reversed(face)])
-    if not result:
-        raise ValueError("CN7 wheel mounting face is missing")
-    return result
+def bore_sections():
+    """Bore land with its inboard chamfer. Chord midpoints sit on the nominal bore."""
+    n=80
+    r=BORE/2/cos(pi/n)
+    z0,z1=OFFSET,OFFSET+WEB_THICKNESS
+    section=((r+BORE_CHAMFER,z0),(WEB_LAND,z0),(WEB_LAND,z1),(r,z1),(r,z0+BORE_CHAMFER))
+    for i in range(n):
+        a,b=tau*i/n,tau*(i+1)/n
+        yield [Gf.Vec3f(q*cos(t),q*sin(t),z) for t in (a,b) for q,z in section]
 
 
-def material(stage,name,friction,dynamic=None,combine=None):
+def web_sections():
+    """Split the mounting web into well-shaped convex cells with open bore and lug holes.
+
+    The render mesh is a Delaunay triangulation whose slivers give near-parallel contact
+    normals and an ill-conditioned solve once the hub is seated.
+    """
+    low,high,outer=WEB_LAND,.0695,CENTER_WEB_RADIUS
+    half=radians(13.)
+    point=lambda r,t: (r*cos(t),r*sin(t))
+
+    def ring(r0,r1,a,b,count):
+        for i in range(count):
+            t0,t1=a+(b-a)*i/count,a+(b-a)*(i+1)/count
+            yield [point(r0,t0),point(r1,t0),point(r1,t1),point(r0,t1)]
+
+    cells=list(ring(high,outer,0.,tau,40))
+    for i,(hx,hy) in enumerate(BOLT_CENTERS):
+        base=tau*i/5
+        cells+=ring(low,high,base+half,base+tau/5-half,4)
+        frame=[point(low,base-half+2*half*k/6) for k in range(6)]
+        frame+=[point(low+(high-low)*k/6,base+half) for k in range(6)]
+        frame+=[point(high,base+half-2*half*k/6) for k in range(6)]
+        frame+=[point(high-(high-low)*k/6,base-half) for k in range(6)]
+        hole=[]
+        for x,y in frame:
+            d=sqrt((x-hx)**2+(y-hy)**2)
+            # Circumscribe the arc so chords do not cut into the drilled clearance.
+            r=LUG_HOLE/2/cos(pi/24)
+            hole.append((hx+(x-hx)*r/d,hy+(y-hy)*r/d))
+        for k in range(24):
+            j=(k+1)%24
+            quad=[hole[k],frame[k],frame[j],hole[j]]
+            area=sum(quad[m][0]*quad[(m+1)%4][1]-quad[(m+1)%4][0]*quad[m][1] for m in range(4))
+            cells.append(quad if area>0 else quad[::-1])
+    return cells
+
+
+def material(stage,name,friction,dynamic=None,combine=None,stiffness=0.,damping=0.):
     mat=UsdShade.Material.Define(stage,ROOT+"/Materials/"+name)
     api=UsdPhysics.MaterialAPI.Apply(mat.GetPrim())
     api.CreateStaticFrictionAttr(friction)
     api.CreateDynamicFrictionAttr(friction*.82 if dynamic is None else dynamic)
     api.CreateRestitutionAttr(.02)
-    if combine:
-        PhysxSchema.PhysxMaterialAPI.Apply(mat.GetPrim()).CreateFrictionCombineModeAttr(combine)
+    if combine or stiffness:
+        options=PhysxSchema.PhysxMaterialAPI.Apply(mat.GetPrim())
+        if combine:
+            options.CreateFrictionCombineModeAttr(combine)
+        if stiffness:
+            options.CreateCompliantContactStiffnessAttr(stiffness)
+            options.CreateCompliantContactDampingAttr(damping)
     return mat
 
 
@@ -230,9 +291,8 @@ class Station:
     initial_gap: float
     transfer: object
     stopper: str
-    cradle: object
-    cradle_collisions: tuple
-    spindle: object = None
+    chuck: object
+    rng: object
     phase: str = "conveyor"
     target: float = 0.
     error: float = 0.
@@ -253,9 +313,27 @@ class Station:
     max_grip_slip: float = 0.
     peak_pad_force: float = 0.
     pad_force_step: float = 0.
+    angle_noise: float = 0.
+    chuck_slip: float = 0.
+    chuck_datum: object = None
 
     def target_gap(self, minimum, velocity, dt):
         self.press.Set(max(minimum-self.initial_gap,self.press.Get()-velocity*dt))
+
+    def measured_angle(self, angle):
+        # Band-limited camera/encoder error instead of a perfect pose readback.
+        self.angle_noise+=.02*(self.rng.gauss(0.,ANGLE_NOISE*7.)-self.angle_noise)
+        return angle+self.angle_noise
+
+    def track_chuck(self, api, window):
+        plate=api.get_rigidbody_transformation(self.chuck.path)
+        if not plate.get("ret_val"):
+            return
+        inverse=Gf.Rotation(quaternion(plate)).GetInverse()
+        local=inverse.TransformDir(Gf.Vec3d(*window["position"])-Gf.Vec3d(*plate["position"]))
+        if self.chuck_datum is None:
+            self.chuck_datum=local
+        self.chuck_slip=max(self.chuck_slip,(local-self.chuck_datum).GetLength())
 
     def step(self, api, dt, allow_insert, car_pose, vehicle_docked):
         self.transfer.park(dt)
@@ -264,10 +342,11 @@ class Station:
             return
         p=window["position"]
         q=window["rotation"]
-        inv_car=Gf.Rotation(quaternion(car_pose)).GetInverse() if vehicle_docked else Gf.Rotation()
+        # Gf.Rotation() is uninitialized memory, not identity.
+        inv_car=Gf.Rotation(quaternion(car_pose)).GetInverse() if vehicle_docked else rotate((0,0,1),0.)
         axis=inv_car.TransformDir(Gf.Rotation(Gf.Quatd(q[3],Gf.Vec3d(q[0],q[1],q[2])))
                                   .TransformDir(Gf.Vec3d(1,0,0)))
-        angle=degrees(atan2(-self.side*axis[2],axis[0]))
+        angle=self.measured_angle(degrees(atan2(-self.side*axis[2],axis[0])))
         self.error=(angle+36.)%72.-36.
         previous_gap=self.gap
         origin=Gf.Vec3d(*car_pose["position"]) if vehicle_docked else Gf.Vec3d(0.)
@@ -276,6 +355,8 @@ class Station:
         speed=abs(self.gap-previous_gap)/dt
         self.center_error=((local_wheel[0]-self.hub[0])**2+(local_wheel[2]-self.hub[2])**2)**.5
         self.timer+=dt
+        if self.chuck_datum is not None:
+            self.track_chuck(api,window)
         if self.phase=="conveyor":
             self.max_lateral_travel=max(self.max_lateral_travel,abs(p[1]-self.side*LINE_Y))
             self.conveyed_distance=max(self.conveyed_distance,self.hub[0]+START_AHEAD-p[0])
@@ -302,39 +383,48 @@ class Station:
                 self.transfer.hold(api)
                 self.phase="grip_slip"
             elif self.transfer.step(self.timer,window):
-                self.transfer.release()
-                self.cradle.Set("inherited")
-                for enabled in self.cradle_collisions:
-                    enabled.Set(True)
-                stage=self.press.GetPrim().GetStage()
-                root=self.wheel.rsplit("/",1)[0]
-                shuttle_path=root+"/Shuttle"
-                shuttle_pose=api.get_rigidbody_transformation(shuttle_path)
-                inv=Gf.Rotation(quaternion(shuttle_pose)).GetInverse()
-                relative=inv.TransformDir(Gf.Vec3d(*p)-Gf.Vec3d(*shuttle_pose["position"]))
-                wheel_normal=Gf.Rotation(quaternion(window)).TransformDir(Gf.Vec3d(0,0,1))
-                alignment=Gf.Rotation(Gf.Vec3d(0,0,1),inv.TransformDir(wheel_normal))
-                motor=constrain(UsdPhysics.RevoluteJoint.Define(stage,root+"/Spindle"),
-                                stage.GetPrimAtPath(shuttle_path),stage.GetPrimAtPath(self.wheel),
-                                relative,rot0=alignment.GetQuat())
-                motor.CreateAxisAttr("Z")
-                self.spindle=drive(motor,"angular",angle,115.,16.,52.)
-                self.tip_handoff=True
-                self.phase="handoff"
+                # Index the open chuck to the spoke apertures seen by the camera.
+                self.target=self.error
+                self.chuck.spindle.Set(self.target)
+                self.phase="chuck_approach"
                 self.timer=0.
             elif self.timer>5.:
                 self.transfer.hold(api)
                 self.phase="tip_failed"
+        elif self.phase=="chuck_approach":
+            self.press.Set(max(0.,RETRACT-.24*self.timer))
+            if self.timer>RETRACT/.24+.5:
+                shuttle=api.get_rigidbody_transformation(self.chuck.path)
+                reach=abs(shuttle["position"][1]-self.side*(abs(self.hub[1])+self.initial_gap))
+                if reach<.002:
+                    self.chuck.expand()
+                    self.phase="chuck_grip"
+                    self.timer=0.
+                elif self.timer>6.:
+                    self.phase="chuck_failed"
+        elif self.phase=="chuck_grip":
+            if self.timer>.8 and self.chuck.gripped:
+                self.transfer.release()
+                self.tip_handoff=True
+                self.phase="handoff"
+                self.timer=0.
+            elif self.timer>2.5:
+                self.chuck.contract()
+                self.transfer.hold(api)
+                self.phase="chuck_failed"
         elif self.phase=="handoff":
-            if self.timer>.45:
+            # Counterbalance pressure follows the load onto the chuck as the tip jaws open.
+            self.chuck.set_balance(min(1.,self.timer/.35))
+            if self.timer>.8:
+                self.track_chuck(api,window)
                 self.transfer.finish_handoff(api)
                 self.phase="feed"
                 self.timer=0.
         elif self.phase=="feed":
             self.target_gap(self.feed_gap,.058,dt)
             if self.gap-self.feed_gap<.011 and self.timer>.7:
-                self.target=angle-self.error
-                self.spindle.Set(self.target)
+                self.target-=self.error
+                self.chuck.spindle.Set(self.target)
                 self.phase="align"
                 self.timer=0.
             elif self.timer>3.:
@@ -348,8 +438,12 @@ class Station:
                 self.phase="aligned"
                 self.timer=0.
                 self.seated_samples=0
-            elif self.timer>4.:
+            elif self.timer>6.:
                 self.phase="alignment_failed"
+            elif self.timer>1.5 and round(self.timer*HZ)%(HZ//2)==0:
+                # Trim out windup of the tire and jaws from the measured residual.
+                self.target-=self.error
+                self.chuck.spindle.Set(self.target)
         elif self.phase=="aligned" and allow_insert:
             self.phase="insert"
             self.timer=0.
@@ -374,7 +468,7 @@ class Station:
                 actuator.GetStiffnessAttr().Set(0.)
                 actuator.GetDampingAttr().Set(1200.)
                 self.press.Set(self.gap-self.initial_gap)
-                spindle_drive=UsdPhysics.DriveAPI(self.spindle.GetPrim(),"angular")
+                spindle_drive=UsdPhysics.DriveAPI(self.chuck.spindle.GetPrim(),"angular")
                 spindle_drive.GetStiffnessAttr().Set(0.)
                 spindle_drive.GetDampingAttr().Set(3.)
 
@@ -443,10 +537,37 @@ def tip_fixture(stage,path,axle,side,start,steel_material,pad_material):
         shape(jaw,"Arm",(.172,direction*.016,.027),(.37,.051,.064),guard)
         shape(jaw,"JawHead",(0.,direction*.009,.013),(.145,.062,.102),guard)
         pads.add(shape(jaw,"RubberPad",(0.,-direction*.029,.013),(.133,.025,.092),rubber,pad_material))
+    # The PHL-W synchronizes both jaws by rack and pinion. Two independent force-limited
+    # jaws saturate at equal and opposite force and then carry no load along their own axis.
+    # PhysX's maximal-coordinate rack joint drops the pinion reaction, so the gear train is a
+    # reduced-coordinate articulation where internal forces stay internal.
+    articulate(lift,stage.GetPrimAtPath(path+"/TipLiftDrive"))
+    mimic(stage.GetPrimAtPath(path+"/TipJawBDrive"),path+"/TipJawADrive",1.)
     return Transfer(str(tool.GetPath()),(x,y,z,pitch),jaws,pads,origin,start,side)
 
 
-def make_station(stage, car, name, seed, drift, sections, mats, rail_probe=False):
+def articulate(root,*outside):
+    UsdPhysics.ArticulationRootAPI.Apply(root)
+    options=PhysxSchema.PhysxArticulationAPI.Apply(root)
+    options.CreateEnabledSelfCollisionsAttr(False)
+    options.CreateSolverPositionIterationCountAttr(64)
+    options.CreateSolverVelocityIterationCountAttr(4)
+    options.CreateSleepThresholdAttr(0.)
+    options.CreateStabilizationThresholdAttr(0.)
+    for joint in outside:
+        UsdPhysics.Joint(joint).CreateExcludeFromArticulationAttr(True)
+
+
+def mimic(joint,reference_path,gearing):
+    """Two-way gear coupling: position + gearing * reference = 0."""
+    api=PhysxSchema.PhysxMimicJointAPI.Apply(joint,UsdPhysics.Tokens.rotX)
+    api.CreateReferenceJointRel().SetTargets([reference_path])
+    api.CreateGearingAttr(gearing)
+    api.CreateOffsetAttr(0.)
+
+
+def make_station(stage, car, name, rng, drift, sections, mats, rail_probe=False):
+    seed=rng.uniform(-180.,180.)
     axle,side=STATIONS[name]
     gap=LINE_Y-half_track(axle)
     hub_y=side*half_track(axle)
@@ -454,9 +575,9 @@ def make_station(stage, car, name, seed, drift, sections, mats, rail_probe=False
     hub_xform=transform(stage,str(car.GetPath())+"/Contact_"+name,(axle,hub_y,HUB_Z),axle_q)
     hp=str(hub_xform.GetPath())
     pin(stage,hp+"/Face",(0,0),OFFSET-.012,.012,FLANGE_RADIUS,mats[0])
-    pin(stage,hp+"/Pilot",(0,0),OFFSET,PILOT_LENGTH,PILOT/2,mats[0])
+    tapered_pin(stage,hp+"/Pilot",(0,0),OFFSET,PILOT_LENGTH,PILOT/2,PILOT_LEAD,mats[0])
     for i,center in enumerate(BOLT_CENTERS):
-        pin(stage,hp+f"/Stud_{i}",center,OFFSET,STUD_PROJECTION,STUD_DIAMETER/2,mats[0])
+        tapered_pin(stage,hp+f"/Stud_{i}",center,OFFSET,STUD_PROJECTION,STUD_DIAMETER/2,STUD_LEAD,mats[0])
     # Sectioned arch proxy shares the CAD liner's radial datum.
     for i in range(10):
         a=-side*i*tau/20
@@ -467,22 +588,15 @@ def make_station(stage, car, name, seed, drift, sections, mats, rail_probe=False
     wp=ROOT+"/"+name
     origin=(axle+drift,hub_y,HUB_Z)
     start=(origin[0],hub_y+side*(gap+FEED_STROKE),HUB_Z)
-    slide=body(stage,wp+"/Shuttle",start,axle_q,42.)
+    retracted=(start[0],start[1]+side*RETRACT,start[2])
+    slide=body(stage,wp+"/Shuttle",retracted,axle_q,42.)
     mass_properties(slide,(0.,side*.29,.02),box_inertia(42.,(.55,.32,.29)))
-    roller_offset=sqrt(CN7_R16.radius**2-.145**2)+.036
-    cradle=transform(stage,wp+"/Shuttle/Cradle",(0.,side*roller_offset,0.),
-                     rotate((1,0,0),side*90).GetQuat())
-    cradle_visual=reference(stage,str(cradle.GetPath())+"/Visual",REFERENCE+f"/LoadSupport_{name}/Carriage",True)
-    cradle_visible=cradle.CreateVisibilityAttr("invisible")
-    cradle_collisions=[]
-    for part in cradle_visual.GetChildren():
-        if part.GetName() in ("Fork","Roller0","Roller1","GuideUpright_0","GuideUpright_1","GuideBridge"):
-            collider(part)
-            enabled=UsdPhysics.CollisionAPI(part).CreateCollisionEnabledAttr(False)
-            cradle_collisions.append(enabled)
     delivery=(axle+START_AHEAD,side*(LINE_Y+(.008 if rail_probe else 0.)),BELT_Z+.125)
-    position=body(stage,wp+"/Wheel",delivery,rotate((0,0,1),seed).GetQuat(),WHEEL_MASS)
-    mass_properties(position,(0.,0.,0.),wheel_inertia(CN7_R16))
+    position=body(stage,wp+"/Wheel",delivery,rotate((0,0,1),seed).GetQuat(),
+                  WHEEL_MASS*(1+rng.uniform(-MASS_SCATTER,MASS_SCATTER)))
+    heavy=rng.uniform(0.,tau)
+    shift=rng.uniform(0.,IMBALANCE)/WHEEL_MASS
+    mass_properties(position,(shift*cos(heavy),shift*sin(heavy),0.),wheel_inertia(CN7_R16))
     PhysxSchema.PhysxRigidBodyAPI(position).CreateEnableCCDAttr(True)
     if rail_probe:
         UsdPhysics.RigidBodyAPI(position).CreateVelocityAttr(Gf.Vec3f(0,side*.30,0))
@@ -490,7 +604,9 @@ def make_station(stage, car, name, seed, drift, sections, mats, rail_probe=False
     PhysxSchema.PhysxContactReportAPI.Apply(position).CreateThresholdAttr(0.)
     reference(stage,wheel_path+"/Visual","/AssetLibrary/Wheel_16")
     for i,points in enumerate(sections):
-        hull(stage,wheel_path+f"/Web_{i}",points,OFFSET,OFFSET+.014,True,mats[0])
+        hull(stage,wheel_path+f"/Web_{i}",points,OFFSET,OFFSET+WEB_THICKNESS,True,mats[0])
+    for i,points in enumerate(bore_sections()):
+        convex_prism(stage,wheel_path+f"/Web_Bore_{i}",points,5,True,mats[0])
     # Tire envelope with a crowned tread and rounded shoulders at the 205 mm sidewalls.
     radius=CN7_R16.radius
     half_width=CN7_R16.width/2
@@ -502,17 +618,27 @@ def make_station(stage, car, name, seed, drift, sections, mats, rail_probe=False
         b=(i+1)*tau/32
         points=[Gf.Vec3f(r*cos(t),r*sin(t),z) for t in (a,b) for r,z in profile]
         convex_prism(stage,wheel_path+f"/Tread_{i}",points,len(profile),False,mats[1])
+    for i,points in enumerate(rim_sections()):
+        convex_prism(stage,wheel_path+f"/Rim_{i}",points,4,False,mats[0])
+    for i in range(JAWS):
+        for j in range(2):
+            blade=stage.GetPrimAtPath(wheel_path+f"/Visual/Spoke_{i}/Blade_{j}")
+            UsdPhysics.MeshCollisionAPI.Apply(blade).CreateApproximationAttr("convexHull")
+            collider(blade,mats[0])
     initial_gap=gap+FEED_STROKE
     insert=constrain(UsdPhysics.PrismaticJoint.Define(stage,wp+"/Insertion"),None,slide,
                      start,rot0=axle_q)
     insert.CreateAxisAttr("Z")
     insert.CreateLowerLimitAttr(-.012-initial_gap)
-    insert.CreateUpperLimitAttr(.075-FEED_STROKE)
-    press=drive(insert,"linear",0.,9000.,2300.,PRESS_FORCE)
+    insert.CreateUpperLimitAttr(RETRACT+.015)
+    press=drive(insert,"linear",RETRACT,9000.,2300.,PRESS_FORCE)
+    chuck=Chuck(stage,wp,slide,retracted,axle_q,side,mats[4],
+                (body,constrain,drive,mass_properties,rotate,articulate,mimic))
+    chuck.set_balance(0.)
     stopper=station_hardware(stage,wp,axle,side,mats[2])
     transfer=tip_fixture(stage,wp,axle,side,start,mats[0],mats[3])
     return Station(name,side,Gf.Vec3d(axle,hub_y,HUB_Z),wheel_path,press,seed,gap,
-                   initial_gap,transfer,stopper,cradle_visible,tuple(cradle_collisions))
+                   initial_gap,transfer,stopper,chuck,Random(rng.random()))
 
 
 class Robot:
@@ -667,14 +793,9 @@ class Carrier:
         self.clamp_target=0.
         self.clamps=[]
         self.clamp_contacts=set()
-        self.grounded=False
         self.velocity=Gf.Vec3d(0.)
-        traction=PhysxSchema.PhysxForceAPI.Apply(deck)
         PhysxSchema.PhysxContactReportAPI.Apply(deck).CreateThresholdAttr(0.)
-        traction.CreateWorldFrameEnabledAttr(True)
-        traction.CreateModeAttr("force")
-        self.force=traction.CreateForceAttr(Gf.Vec3f(0.))
-        self.yaw_torque=traction.CreateTorqueAttr(Gf.Vec3f(0.))
+        self.wheels={}
         self.previous_yaw=0.
         support=material(stage,"AMRSupport",0.,0.,combine="min")
         for i,x in enumerate((-.72,.72)):
@@ -684,16 +805,24 @@ class Carrier:
                 item.AddTranslateOp().Set(Gf.Vec3d(x,y,AMR_WHEEL_RADIUS))
                 collider(item.GetPrim(),support)
                 item.CreateVisibilityAttr("invisible")
+                # Drive force acts at each floor contact, so braking pitches the platform.
+                patch=UsdGeom.Xform.Define(stage,self.path+f"/Traction_{i}_{j}")
+                patch.AddTranslateOp().Set(Gf.Vec3d(x,y,0.))
+                traction=PhysxSchema.PhysxForceAPI.Apply(patch.GetPrim())
+                traction.CreateWorldFrameEnabledAttr(True)
+                traction.CreateModeAttr("force")
+                self.wheels[f"Support_{i}_{j}"]=(Gf.Vec3d(x,y,0.),traction.CreateForceAttr(Gf.Vec3f(0.)))
+        self.loads=dict.fromkeys(self.wheels,0.)
         cube(stage,self.path+"/Collision",(0.,0.,.28),(AMR_SIZE[0],AMR_SIZE[1],.33))
         joint=constrain(UsdPhysics.PrismaticJoint.Define(stage,ROOT+"/VehicleLift"),deck,lift,(0.,0.,-.12))
         joint.CreateAxisAttr("Z")
         joint.CreateLowerLimitAttr(-.02)
         joint.CreateUpperLimitAttr(.14)
         self.stiffness=1600000.
-        self.lift_load=(AMR_LIFT_MASS+BODY_MASS)*9.81
+        self.lift_load=(AMR_LIFT_MASS+BODY_MASS)*GRAVITY
         self.lift_drive=drive(joint,"linear",self.lift_load/self.stiffness,self.stiffness,
                               servo_damping(self.stiffness,AMR_LIFT_MASS+BODY_MASS),
-                              (AMR_PAYLOAD+AMR_LIFT_MASS)*9.81)
+                              (AMR_PAYLOAD+AMR_LIFT_MASS)*GRAVITY)
 
     def add_clamp(self,stage,path,source):
         base=reference(stage,path+"/Base",source+"/Base")
@@ -743,15 +872,26 @@ class Carrier:
             delta=delta.GetNormalized()*(AMR_ACCELERATION*dt)
         self.velocity+=delta
         force=(self.velocity-velocity)*(self.total_mass*6.)
-        limit=AMR_TRACTION_COEFFICIENT*self.total_mass*9.81
-        if force.GetLength()>limit:
-            force=force.GetNormalized()*limit
-        self.force.Set(vec(force) if self.grounded else Gf.Vec3f(0.))
-        front=Gf.Rotation(quaternion(state)).TransformDir(Gf.Vec3d(1,0,0))
+        rotation=Gf.Rotation(quaternion(state))
+        front=rotation.TransformDir(Gf.Vec3d(1,0,0))
         yaw=atan2(front[1],front[0])
-        target_torque=-3600*yaw-900*(yaw-self.previous_yaw)/dt
-        bounded=max(-limit*.31,min(limit*.31,target_torque)) if self.grounded else 0.
-        self.yaw_torque.Set(Gf.Vec3f(0.,0.,bounded))
+        normal=sum(self.loads.values())
+        torque=-3600*yaw-900*(yaw-self.previous_yaw)/dt
+        spread=sum(p[0]*p[0]+p[1]*p[1] for p,_ in self.wheels.values())
+        speed=velocity.GetLength()
+        for name,(point_local,attr) in self.wheels.items():
+            load=self.loads[name]
+            if not load or not normal:
+                attr.Set(Gf.Vec3f(0.))
+                continue
+            arm=rotation.TransformDir(point_local)
+            wheel_force=force*(load/normal)+Gf.Vec3d(-arm[1],arm[0],0.)*(torque/spread)
+            limit=AMR_TRACTION_COEFFICIENT*load
+            if wheel_force.GetLength()>limit:
+                wheel_force=wheel_force.GetNormalized()*limit
+            if speed>.002:
+                wheel_force-=velocity*(AMR_ROLLING_RESISTANCE*load/speed*min(1.,speed/.02))
+            attr.Set(vec(wheel_force))
         self.previous_yaw=yaw
         if self.docked:
             close=DOCK_CLAMP_OPEN-DOCK_CLAMP_CLOSED
@@ -820,7 +960,7 @@ class Cell:
         UsdGeom.Scope.Define(stage,"/World/Orders").CreateVisibilityAttr().Set("invisible")
         scene=UsdPhysics.Scene.Define(stage,ROOT+"/Physics")
         scene.CreateGravityDirectionAttr(Gf.Vec3f(0,0,-1))
-        scene.CreateGravityMagnitudeAttr(9.81)
+        scene.CreateGravityMagnitudeAttr(GRAVITY)
         options=PhysxSchema.PhysxSceneAPI.Apply(scene.GetPrim())
         options.CreateEnableGPUDynamicsAttr(False)
         options.CreateBroadphaseTypeAttr("MBP")
@@ -858,21 +998,32 @@ class Cell:
                             stage.OverridePrim(target+"/"+item.GetName()).SetActive(False)
         cube(stage,ROOT+"/CN7/Undertray",(0,0,1.10),(3.7,1.16,.23))
         cube(stage,ROOT+"/CN7/Body",(0,0,1.55),(4.56,1.57,.36))
-        sections=collision_web(stage)
-        mats=(material(stage,"Steel",.27),material(stage,"Rubber",.82),material(stage,"RollerGrip",.62),
-              material(stage,"GripPad",PAD_STATIC_FRICTION,PAD_DYNAMIC_FRICTION,combine="min"))
+        sections=web_sections()
+        rng=Random(seed)
+        vary=lambda value: value*(1+rng.uniform(-FRICTION_SCATTER,FRICTION_SCATTER))
+        pad=vary(1.)
+        tire=2*TIRE_DAMPING_RATIO*sqrt(TIRE_STIFFNESS*WHEEL_MASS)
+        mats=(material(stage,"Steel",vary(.27)),
+              material(stage,"Rubber",vary(.82),stiffness=TIRE_STIFFNESS/TIRE_CONTACT_POINTS,
+                       damping=tire/TIRE_CONTACT_POINTS),
+              material(stage,"RollerGrip",vary(.62)),
+              material(stage,"GripPad",PAD_STATIC_FRICTION*pad,PAD_DYNAMIC_FRICTION*pad,combine="min"))
+        chuck_pad=material(stage,"ChuckPad",PAD_STATIC_FRICTION*pad,PAD_DYNAMIC_FRICTION*pad,combine="min",
+                           stiffness=CHUCK_PAD_STIFFNESS,damping=CHUCK_PAD_DAMPING)
+        mats+=(chuck_pad,)
+        # Vehicle pads on the lift are solid rubber, not an inflated tire.
+        bearing=material(stage,"BearingPad",.82)
         for ax in (-1,1):
             for side in (-1,1):
                 pad=cube(stage,f"{ROOT}/DockLift/LoadPad_{ax+1}_{side+1}",(ax*1.65,side*.40,.927),
                          (.16,.10,.116))
-                UsdShade.MaterialBindingAPI.Apply(stage.GetPrimAtPath(pad)).Bind(mats[1],materialPurpose="physics")
+                UsdShade.MaterialBindingAPI.Apply(stage.GetPrimAtPath(pad)).Bind(bearing,materialPurpose="physics")
         for side in (-1,1):
             cube(stage,f"{ROOT}/DockLift/SideLocator_{side+1}",(0,side*.615,1.01),(.20,.06,.06))
             cube(stage,f"{ROOT}/DockLift/EndLocator_{side+1}",(side*1.885,0,1.01),(.06,.20,.06))
         guide=material(stage,"GuideUHMW",GUIDE_STATIC_FRICTION,GUIDE_DYNAMIC_FRICTION,combine="min")
         setup_factory(stage,ROOT,mats[2],guide,branch_side)
-        rng=Random(seed)
-        self.stations=[make_station(stage,car,name,rng.uniform(-180.,180.),.002 if jam and name=="FL" else 0.,
+        self.stations=[make_station(stage,car,name,rng,JAM_OFFSET if jam and name=="FL" else 0.,
                                     sections,mats,rail_probe and name=="FL") for name in STATIONS]
         self.robots=[Robot(stage,REFERENCE+"/"+prefix+role)
                 for prefix in ("Left","Right") for role in ("Mount","Fasten")] if robots else []
@@ -930,11 +1081,11 @@ class Cell:
         task_time=self.seconds-self.dock_ready_time if self.dock_ready_time is not None else 0.
         front_ready=self.carrier.ready and task_time>=12.2
         rear_ready=self.carrier.ready and task_time>=21.2
-        if round(self.seconds*HZ)%4==0:
-            staged_sides={station.side for station in self.stations if station.tip_handoff}
+        if round(self.seconds*HZ)%(HZ//60)==0:
+            # The recorded arm paths know nothing about the live wheel. Zone interlock: an
+            # arm may leave its parking pose only when no fixture on that side is working.
             for robot in self.robots:
-                side=1 if "Left" in robot.path else -1
-                robot.step(task_time if side in staged_sides else 0.)
+                robot.step(0.)
         self.robot_clearance()
         for station in self.stations:
             old=station.phase
@@ -942,6 +1093,7 @@ class Cell:
                 station.step(self.api,dt,front_ready if station.name.startswith("F") else rear_ready,
                              car_pose,self.carrier.ready)
             station.transfer.pad_contacts.clear()
+            station.chuck.pad_contacts.clear()
             station.face_contact_now=False
             station.pad_force_step=0.
             if station.phase!=old:
@@ -949,7 +1101,7 @@ class Cell:
 
     def finish_step(self,dt):
         headers,contacts=self.sim.get_contact_report()[:2]
-        self.carrier.grounded=False
+        self.carrier.loads=dict.fromkeys(self.carrier.wheels,0.)
         self.carrier.clamp_contacts.clear()
         for header in headers:
             if not header.num_contact_data:
@@ -967,7 +1119,9 @@ class Cell:
                     self.stop_pair(*self.pair_by_robot[robot.path],"equipment_contact")
             for face,other in ((collider0,collider1),(collider1,collider0)):
                 if face.startswith(self.carrier.path+"/Support_") and other in (ROOT+"/Floor","/World/Factory/DockPlate"):
-                    self.carrier.grounded=True
+                    first=header.contact_data_offset
+                    self.carrier.loads[face.rsplit("/",1)[1]]+=sum(
+                        abs(contacts[i].impulse[2])/dt for i in range(first,first+header.num_contact_data))
                 if face.startswith(ROOT+"/DockClamp_") and face.endswith("/Pad") and other==self.carrier.path+"/Collision":
                     self.carrier.clamp_contacts.add(face)
                 station=self.by_contact_face.get(face)
@@ -985,6 +1139,11 @@ class Cell:
                         unit.pad_force_step+=pad_force
                         if pad_force>5.:
                             unit.transfer.pad_contacts.add(face)
+                    if face in unit.chuck.pads and "/Rim_" in other:
+                        force=sum(abs(Gf.Dot(vec(contacts[i].impulse),vec(contacts[i].normal)))/dt for i in
+                                  range(header.contact_data_offset,header.contact_data_offset+header.num_contact_data))
+                        if force>50.:
+                            unit.chuck.pad_contacts.add(face)
                     if "/Conveyor/" in face and "Guide_" in face:
                         unit.guide_contact=True
                     if face==unit.stopper:

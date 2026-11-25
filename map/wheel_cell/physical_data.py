@@ -47,6 +47,39 @@ GUIDE_DYNAMIC_FRICTION = .22
 GUIDE_STATIC_FRICTION = .28
 
 
+# Local gravity, Gyeonggi/Seoul region, in m/s².
+GRAVITY = 9.799
+# Wheel-to-wheel scatter. The controller only ever uses the nominal catalog values.
+MASS_SCATTER = .015
+FRICTION_SCATTER = .10
+IMBALANCE = 60e-5                  # kg·m static imbalance (60 g·cm) before balancing
+# Inflated 205/55 R16 passenger tire, literature-range radial rate and damping ratio.
+TIRE_STIFFNESS = 200000.
+TIRE_DAMPING_RATIO = .06
+TIRE_CONTACT_POINTS = 4            # solver points that typically share one load patch
+# Camera and encoder measurement error, one standard deviation.
+ANGLE_NOISE = .03                  # degrees
+# Expanding rim chuck on a remote-center compliance. Engineering estimates.
+CHUCK_MASS = 8.
+CHUCK_JAW_MASS = .5
+CHUCK_JAW_FORCE = 600.
+CHUCK_STROKE = .020
+# Bonded urethane facing, per solver contact point.
+CHUCK_PAD_STIFFNESS = 1.5e6
+CHUCK_PAD_DAMPING = 1500.
+FLOAT_MASS = 10.
+FLOAT_LATERAL = 60000.             # N/m
+FLOAT_LATERAL_LIMIT = .004
+FLOAT_TILT = 8000.                 # N·m/rad
+FLOAT_TILT_LIMIT = 1.2             # degrees
+SPINDLE_TORQUE = 52.
+# Chamfers of the modeled hub pilot and M12 stud: axial length and radial reduction.
+PILOT_LEAD = (.0016, .0014)
+STUD_LEAD = (.0012, .0013)
+# Polyurethane omniMove rollers on sealed concrete.
+AMR_ROLLING_RESISTANCE = .02
+
+
 def box_inertia(mass, size):
     x, y, z = size
     return tuple(mass * value / 12 for value in (y*y+z*z, x*x+z*z, x*x+y*y))
