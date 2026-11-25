@@ -5,13 +5,13 @@ HMGICS 셀 생산 방식을 참고한 Isaac Sim 5.1 물리 환경입니다. 라�
 ## 실행
 
 ```bash
-cd "$(git rev-parse --show-toplevel)"
+cd "$HOME/project"
 ./map/wheel_cell/run.sh --wheel-detail --seed 42
 ```
 
 **CN7 | Live PhysX** 창에서 **Play**를 누릅니다. `--assembly`는 셀 전체, `--hub-detail`은 허브, `--top`은 상부 카메라를 엽니다. `--seed`를 생략하면 휠의 초기 회전각을 새로 뽑습니다. `--jam`은 왼쪽 앞 삽입 지그에 2 mm 횡오차를 줍니다.
 
-- `output/wheel_cell.usdc`는 라이브 실행에서 참조하는 모델과 별도의 키프레임 시연을 담습니다. `run.sh --replay` 또는 Isaac Sim의 기본 타임라인에서 시연을 재생할 수 있습니다.
+- 장면은 `map/scene/wheel_cell.usda`(루트)와 영역별 레이어로 나뉩니다. 라이브 실행에서 참조하는 모델과 별도의 키프레임 시연을 담습니다. 나눠서 작업하는 방법은 [`../scene/README.md`](../scene/README.md)를 보세요. `run.sh --replay` 또는 Isaac Sim의 기본 타임라인에서 시연을 재생할 수 있습니다.
 - `output/wheel_cell_physics.usdc`는 강체, 재료, 관절과 초기 자세를 포함합니다. Isaac Sim에서 직접 열면 초기 상태의 물리 실험과 자체 롤러 구동을 볼 수 있습니다. AMR 주행·파지·삽입 명령은 위 라이브 실행에서 작동합니다.
 - 기본 렌더링은 1080p RTX이며 `--quality cinematic`은 1440p 패스 트레이싱입니다. 실행기의 기본 VRAM 감시 기준은 8 GiB입니다. USD를 옮길 때는 `concrete.png`를 같은 폴더에 둡니다.
 

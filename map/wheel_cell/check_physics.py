@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from math import dist
 from pathlib import Path
 import sys
@@ -131,8 +132,12 @@ def check(path, seed, jam, robots, rail_probe, export, interference_probe, tip_d
             if interference_probe and i==int(DOCK_READY+2)*HZ:
                 for robot in cell.rail_pairs[0]:
                     robot.rail.Set(0.)
-                    robot.step=lambda _:None
+                    robot.advance=lambda *_:None
             cell.step()
+            if os.environ.get("CELL_DEBUG") and cell.pending:
+                for event in cell.pending:
+                    print("EVENTDBG",*event,flush=True)
+                cell.pending.clear()
             if tip_drive_off and front_left.phase=="tip_up" and front_left.timer==0.:
                 lift=front_left.transfer.axes[2]
                 UsdPhysics.DriveAPI(lift.GetPrim(),"linear").GetMaxForceAttr().Set(0.)
@@ -149,14 +154,16 @@ def check(path, seed, jam, robots, rail_probe, export, interference_probe, tip_d
             if drive_frame in (0,2*HZ,7*HZ,10*HZ,12*HZ,14*HZ,18*HZ,22*HZ,25*HZ):
                 for robot in cell.robots:
                     side=1 if "Left" in robot.path else -1
-                    if robot.paused_targets or not any(station.side==side and station.tip_handoff for station in cell.stations):
+                    if (robot.paused_targets or robot.sample is None
+                            or not any(station.side==side and station.tip_handoff for station in cell.stations)):
                         continue
                     measured=cell.api.get_rigidbody_transformation(robot.path+"/Link_6")["position"]
-                    sample=SOURCE_POSE+drive_frame/HZ
-                    if "Fasten" in robot.source:
-                        sample=min(sample,54.)
+                    sample=robot.sample
                     expected=pose(stage,robot.source+"/Joint_6",sample)[0]
                     tracking=max(tracking,dist(measured,expected))
+                    if os.environ.get("CELL_DEBUG"):
+                        print("TRACKDBG",drive_frame/HZ,robot.path.rsplit("/",1)[1],round(dist(measured,expected)*1000,1),
+                              [round(v,3) for v in measured],[round(v,3) for v in expected],flush=True)
                     tracking_samples+=1
             if interference_probe and i>int(DOCK_READY+10)*HZ:
                 break
@@ -219,7 +226,7 @@ def check(path, seed, jam, robots, rail_probe, export, interference_probe, tip_d
 
 def main():
     args=argparse.ArgumentParser()
-    args.add_argument("--stage",type=Path,default=root/"output/wheel_cell.usdc")
+    args.add_argument("--stage",type=Path,default=root.parent/"scene"/"wheel_cell.usda")
     args.add_argument("--seed",type=int,default=42)
     args.add_argument("--jam",action="store_true")
     args.add_argument("--without-robots",action="store_true")

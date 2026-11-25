@@ -1,5 +1,6 @@
 """Live, docked four-corner PhysX assembly with encoder-driven wheel alignment."""
 
+import os
 from dataclasses import dataclass
 from math import atan2, cos, degrees, sin, sqrt, tau
 from pathlib import Path
@@ -18,7 +19,7 @@ from physical_data import GUIDE_DYNAMIC_FRICTION, GUIDE_STATIC_FRICTION
 from physical_data import AMR_ACCELERATION, AMR_LIFT_MASS, AMR_LIFT_SPEED, AMR_MASS, AMR_PAYLOAD, AMR_SIZE
 from physical_data import AMR_SPEED_X, AMR_SPEED_Y, AMR_TRACTION_COEFFICIENT, AMR_WHEEL_RADIUS
 from physical_data import DOCK_CLAMP_CLOSED, DOCK_CLAMP_OPEN
-from process import BELT_Z, CN7_R16, HUB_Z, LINE_Y, RAIL_Y, STATIONS
+from process import BELT_Z, CN7_R16, HUB_Z, LINE_Y, RAIL_Y, STATIONS, schedule
 
 ROOT = "/World/Live"
 REFERENCE = "/World/Orders/CN7_001"
@@ -27,9 +28,20 @@ ALIGN_TOL = .12                    # degrees, as measured by the simulated encod
 FEED_STROKE = .060
 SEAT_TOL = .0007                   # numerical seating tolerance, not a production tolerance
 PRESS_FORCE = 145.                # prototype insertion effort limit in newtons
+FLOAT_TRAVEL = .0015              # m, radial float of the spindle compliance unit
+FLOAT_STIFFNESS = 4e5             # N/m; 0.3 mm hub offset -> ~120 N centring force
+FLOAT_DAMPING = 5000.             # N·s/m, near critical for the 16 kg wheel
+FLOAT_MASS = .5
+INSERT_TIMEOUT = 12.              # s; ~5.5 s of 0.4 m travel, then slow pilot-bore engagement under friction
 DOCK_READY = 35.
 SOURCE_POSE = 30.5                # seconds on the mechanical preview stage
 MIN_RAIL_SPACING = 1.55           # meters between carriage origins, including braking clearance
+_FIRST_ORDER = next(schedule(False))
+FRONT_SEAT = _FIRST_ORDER[5]-SOURCE_POSE   # task seconds at which the replay seats the front wheels
+REAR_SEAT = _FIRST_ORDER[6]-SOURCE_POSE
+GUIDE_LEAD = 2.2                  # replay: mount tool reaches the wheel-side standby before seating
+GUIDE_EXIT = 1.35                 # replay: mount tool is back at its safe pose after seating
+GUIDE_RETREAT = 2.0               # live: joint-space withdrawal from standby to the safe pose
 TERMINAL_PHASES = frozenset(("seated","jammed","alignment_failed","feed_failed","clamp_failed",
                              "grip_slip","tip_failed","interference","dock_lost"))
 
@@ -276,6 +288,13 @@ class Station:
         speed=abs(self.gap-previous_gap)/dt
         self.center_error=((local_wheel[0]-self.hub[0])**2+(local_wheel[2]-self.hub[2])**2)**.5
         self.timer+=dt
+        if os.environ.get("CELL_DEBUG_JAW")==self.name and round(self.timer/dt)%30==0:
+            tool=api.get_rigidbody_transformation(self.transfer.tool)
+            jaws=[api.get_rigidbody_transformation(self.wheel.rsplit("/",1)[0]+f"/TipJaw{k}")["position"][1]-tool["position"][1]
+                  for k in "AB"]
+            print("JAWDBG",self.phase,round(self.timer,2),"tool",[round(v,3) for v in tool["position"]],
+                  "jawA",round(jaws[0],4),"jawB",round(jaws[1],4),"targets",[round(a.Get(),4) for a in self.transfer.jaws],
+                  "wheel",[round(v,3) for v in p],flush=True)
         if self.phase=="conveyor":
             self.max_lateral_travel=max(self.max_lateral_travel,abs(p[1]-self.side*LINE_Y))
             self.conveyed_distance=max(self.conveyed_distance,self.hub[0]+START_AHEAD-p[0])
@@ -298,6 +317,16 @@ class Station:
         elif self.phase=="tip_up":
             slip=self.transfer.slip(api,window)
             self.max_grip_slip=max(self.max_grip_slip,slip)
+            if os.environ.get("CELL_DEBUG_TIP")==self.name:
+                tool=api.get_rigidbody_transformation(self.transfer.tool)
+                rel=Gf.Rotation(quaternion(tool)).GetInverse()*Gf.Rotation(quaternion(window))
+                local=Gf.Rotation(quaternion(tool)).GetInverse().TransformDir(
+                    Gf.Vec3d(*p)-Gf.Vec3d(*tool["position"]))-self.transfer.offset
+                axis=rel.GetAxis()
+                print(f"TIPDBG t={self.timer:.3f} slip={slip*1000:.1f} d=({local[0]*1000:.1f},{local[1]*1000:.1f},{local[2]*1000:.1f})"
+                      f" rot={rel.GetAngle():.1f} axis=({axis[0]:.2f},{axis[1]:.2f},{axis[2]:.2f})"
+                      f" pads={len(self.transfer.pad_contacts)} tool_z={tool['position'][2]:.3f}"
+                      f" pitch={self.transfer.axes[3].Get():.1f}",flush=True)
             if slip>.045:  # observed loss of retention, before handing a displaced tire off
                 self.transfer.hold(api)
                 self.phase="grip_slip"
@@ -312,11 +341,32 @@ class Station:
                 shuttle_pose=api.get_rigidbody_transformation(shuttle_path)
                 inv=Gf.Rotation(quaternion(shuttle_pose)).GetInverse()
                 relative=inv.TransformDir(Gf.Vec3d(*p)-Gf.Vec3d(*shuttle_pose["position"]))
+                # The spindle pilot centres the wheel on the insertion axis (shuttle Z); the
+                # tip transfer itself only places it within 6 mm.
+                relative=Gf.Vec3d(0.,0.,relative[2])
                 wheel_normal=Gf.Rotation(quaternion(window)).TransformDir(Gf.Vec3d(0,0,1))
                 alignment=Gf.Rotation(Gf.Vec3d(0,0,1),inv.TransformDir(wheel_normal))
+                # Floating spindle: a compliance unit lets the hub pilot centre the wheel
+                # radially (docked hub sits ~0.3 mm off the fixed shuttle axis, bore clearance
+                # is 0.05 mm). Spring rate carries the wheel weight via a preload offset.
+                frame=Gf.Rotation(quaternion(shuttle_pose))*alignment
+                float_pos=Gf.Vec3d(*shuttle_pose["position"])+Gf.Rotation(quaternion(shuttle_pose)).TransformDir(relative)
+                floater=body(stage,root+"/SpindleFloat",float_pos,frame.GetQuat(),FLOAT_MASS)
+                mass_properties(floater,(0.,0.,0.),(4e-4,4e-4,4e-4))
+                carrier=constrain(UsdPhysics.Joint.Define(stage,root+"/SpindleCompliance"),
+                                  stage.GetPrimAtPath(shuttle_path),floater,relative,rot0=alignment.GetQuat())
+                weight=frame.GetInverse().TransformDir(Gf.Vec3d(0,0,-9.81*(WHEEL_MASS+FLOAT_MASS)))
+                for dof in ("rotX","rotY","rotZ","transZ"):
+                    lock=UsdPhysics.LimitAPI.Apply(carrier.GetPrim(),dof)
+                    lock.CreateLowAttr(1.)
+                    lock.CreateHighAttr(-1.)
+                for dof,load in (("transX",weight[0]),("transY",weight[1])):
+                    travel=UsdPhysics.LimitAPI.Apply(carrier.GetPrim(),dof)
+                    travel.CreateLowAttr(-FLOAT_TRAVEL)
+                    travel.CreateHighAttr(FLOAT_TRAVEL)
+                    drive(carrier,dof,-load/FLOAT_STIFFNESS,FLOAT_STIFFNESS,FLOAT_DAMPING,1e4)
                 motor=constrain(UsdPhysics.RevoluteJoint.Define(stage,root+"/Spindle"),
-                                stage.GetPrimAtPath(shuttle_path),stage.GetPrimAtPath(self.wheel),
-                                relative,rot0=alignment.GetQuat())
+                                floater,stage.GetPrimAtPath(self.wheel))
                 motor.CreateAxisAttr("Z")
                 self.spindle=drive(motor,"angular",angle,115.,16.,52.)
                 self.tip_handoff=True
@@ -340,6 +390,11 @@ class Station:
             elif self.timer>3.:
                 self.phase="feed_failed"
         elif self.phase=="align":
+            if os.environ.get("CELL_DEBUG") and round(self.timer/dt)%30==1:
+                shuttle=api.get_rigidbody_transformation(self.wheel.rsplit("/",1)[0]+"/Shuttle")
+                radial=Gf.Rotation(quaternion(shuttle)).GetInverse().TransformDir(Gf.Vec3d(*p)-Gf.Vec3d(*shuttle["position"]))
+                print("ALIGNDBG",self.name,round(self.timer,2),"err",round(self.error,3),"target",round(self.target,2),
+                      "angle",round(angle,2),"radial_mm",[round(v*1000,3) for v in radial[:2]],flush=True)
             if abs(self.error)<ALIGN_TOL:
                 self.seated_samples+=1
             else:
@@ -354,6 +409,10 @@ class Station:
             self.phase="insert"
             self.timer=0.
         elif self.phase=="insert":
+            if os.environ.get("CELL_DEBUG") and round(self.timer/dt)%60==1:
+                print("CENTERDBG",self.name,round(self.timer,2),"gap",round(self.gap*1000,2),"center_mm",round(self.center_error*1000,3),
+                      "dx",round((local_wheel[0]-self.hub[0])*1000,3),"dz",round((local_wheel[2]-self.hub[2])*1000,3),
+                      "err_deg",round(self.error,3),"axis",[round(v,5) for v in axis],"car",[round(v,4) for v in car_pose["position"]],flush=True)
             if not vehicle_docked:
                 self.press.Set(self.gap-self.initial_gap)
                 self.phase="dock_lost"
@@ -367,7 +426,7 @@ class Station:
             if self.seated_samples>=12:
                 self.phase="seated"
                 self.press.Set(-.006-self.initial_gap)
-            elif self.timer>8.:
+            elif self.timer>INSERT_TIMEOUT:
                 self.stall_gap=self.gap
                 self.phase="jammed"
                 actuator=UsdPhysics.DriveAPI(self.press.GetPrim(),"linear")
@@ -408,11 +467,11 @@ def tip_fixture(stage,path,axle,side,start,steel_material,pad_material):
         joint.CreateUpperLimitAttr(limits[1])
         return actor,drive(joint,"linear",0.,*settings[1:])
 
-    lift,z=slider("TipLift",None,origin,"Z",(-.215,.29),(14.,340000.,5400.,2400.))
+    lift,z=slider("TipLift",None,origin,"Z",(-.29,.29),(14.,340000.,5400.,2400.))
     mast_y=-side*(.465+.22)
     mass_properties(lift,(.39,mast_y,-.16),box_inertia(14.,(.135,.14,.58)))
     shape(lift,"LiftCarriage",(.39,mast_y,.02),(.135,.14,.16),steel)
-    shape(lift,"LiftMast",(.39,mast_y,-.255),(.069,.081,.52),steel)
+    shape(lift,"LiftMast",(.39,mast_y,-.215),(.069,.081,.44),steel)
     cross,y=slider("TipCross",lift,origin,"Y",(-.27,.27),(6.,195000.,3300.,1200.))
     mass_properties(cross,(.49,-side*.16,.07),box_inertia(6.,(.55,.47,.08)))
     shape(cross,"CrossSlide",(.39,-side*.34,.068),(.105,.66,.076),steel)
@@ -438,11 +497,30 @@ def tip_fixture(stage,path,axle,side,start,steel_material,pad_material):
         damping=servo_damping(stiffness,1.8)
         jaw,drive_target=slider("TipJaw"+label,tool,jaw_position,"Y",
                                 (-JAW_STROKE,JAW_STROKE),(1.8,stiffness,damping,JAW_FORCE))
+        if direction>0:
+            # Point both jaw axes inward so +travel closes either jaw and one pinion couples them.
+            flipped=UsdPhysics.PrismaticJoint(stage.GetPrimAtPath(path+"/TipJawBDrive"))
+            flipped.GetLocalRot0Attr().Set(Gf.Quatf(0.,0.,0.,1.))
+            flipped.GetLocalRot1Attr().Set(Gf.Quatf(0.,0.,0.,1.))
         mass_properties(jaw,(.155,direction*.01,.023),box_inertia(1.8,(.37,.065,.10)))
         jaws.append(drive_target)
         shape(jaw,"Arm",(.172,direction*.016,.027),(.37,.051,.064),guard)
         shape(jaw,"JawHead",(0.,direction*.009,.013),(.145,.062,.102),guard)
         pads.add(shape(jaw,"RubberPad",(0.,-direction*.029,.013),(.133,.025,.092),rubber,pad_material))
+    # PHL-W jaws are rack-and-pinion synchronized: the pair can squeeze but cannot drift
+    # sideways together, so the clamp keeps the tire centred when gravity acts along the jaw axis.
+    pinion=body(stage,path+"/TipPinion",origin,None,.35)
+    mass_properties(pinion,(0.,0.,0.),(2e-4,2e-4,2e-4))
+    shaft=constrain(UsdPhysics.RevoluteJoint.Define(stage,path+"/TipPinionShaft"),tool,pinion)
+    shaft.CreateAxisAttr("Z")
+    for label in ("A","B"):
+        rack=PhysxSchema.PhysxPhysicsRackAndPinionJoint.Define(stage,path+f"/TipSync{label}")
+        rack.CreateBody0Rel().SetTargets([pinion.GetPath()])
+        rack.CreateBody1Rel().SetTargets([Sdf.Path(path+"/TipJaw"+label)])
+        rack.CreateHingeRel().SetTargets([shaft.GetPath()])
+        rack.CreatePrismaticRel().SetTargets([Sdf.Path(path+f"/TipJaw{label}Drive")])
+        rack.CreateRatioAttr(degrees(1/.025))  # 25 mm pitch radius, degrees per metre
+        rack.CreateCollisionEnabledAttr(False)
     return Transfer(str(tool.GetPath()),(x,y,z,pitch),jaws,pads,origin,start,side)
 
 
@@ -468,6 +546,8 @@ def make_station(stage, car, name, seed, drift, sections, mats, rail_probe=False
     origin=(axle+drift,hub_y,HUB_Z)
     start=(origin[0],hub_y+side*(gap+FEED_STROKE),HUB_Z)
     slide=body(stage,wp+"/Shuttle",start,axle_q,42.)
+    if os.environ.get("CELL_DEBUG"):
+        PhysxSchema.PhysxContactReportAPI.Apply(slide).CreateThresholdAttr(0.)
     mass_properties(slide,(0.,side*.29,.02),box_inertia(42.,(.55,.32,.29)))
     roller_offset=sqrt(CN7_R16.radius**2-.145**2)+.036
     cradle=transform(stage,wp+"/Shuttle/Cradle",(0.,side*roller_offset,0.),
@@ -477,7 +557,7 @@ def make_station(stage, car, name, seed, drift, sections, mats, rail_probe=False
     cradle_collisions=[]
     for part in cradle_visual.GetChildren():
         if part.GetName() in ("Fork","Roller0","Roller1","GuideUpright_0","GuideUpright_1","GuideBridge"):
-            collider(part)
+            collider(part,mats[4] if part.GetName().startswith("Roller") else None)
             enabled=UsdPhysics.CollisionAPI(part).CreateCollisionEnabledAttr(False)
             cradle_collisions.append(enabled)
     delivery=(axle+START_AHEAD,side*(LINE_Y+(.008 if rail_probe else 0.)),BELT_Z+.125)
@@ -524,6 +604,11 @@ class Robot:
         model=source_prim.GetAttribute("cell:model").Get().lower()
         tree=ET.parse(Path(__file__).parent/"assets"/(model+".urdf")).getroot()
         self.path=ROOT+"/"+source_prim.GetName()
+        self.clock=0.
+        self.sample=SOURCE_POSE
+        self.detour=None
+        self.holds=[(seat-GUIDE_LEAD,seat,axle) for seat,axle in ((FRONT_SEAT,"F"),(REAR_SEAT,"R"))
+                    ] if "Mount" in source else []
         transform(stage,self.path)
         carriage,_=pose(stage,source,SOURCE_POSE)
         base=body(stage,self.path+"/RailCarriage",carriage,None,115.)
@@ -644,10 +729,54 @@ class Robot:
         if "Fasten" in self.source:
             # Clearance posture while the wheels are still held by the insertion fixtures.
             sample=min(sample,54.)
+        self.sample=sample
         self.rail.Set(pose(self.stage,self.source,sample)[0][0])
         time=sample*self.stage.GetTimeCodesPerSecond()
         for attr, source in self.drives:
             attr.Set(source.Get(time))
+
+    def blend(self, a, b, fraction):
+        self.rail.Set(pose(self.stage,self.source,a)[0][0]*(1-fraction)+pose(self.stage,self.source,b)[0][0]*fraction)
+        rate=self.stage.GetTimeCodesPerSecond()
+        for attr, source in self.drives:
+            attr.Set(source.Get(a*rate)*(1-fraction)+source.Get(b*rate)*fraction)
+
+    def advance(self, dt, running, finished):
+        """Follow the replay keyframes on a process clock.
+
+        In the replay the mount robot carries the wheel onto the hub; live, the station
+        shuttle presses it. The mount robot therefore waits at the wheel-side standby
+        pose until finished(axle) reports that axle's insertion over, then withdraws in
+        joint space to the replay's post-seating safe pose instead of following the
+        wheel inward ahead of the press.
+        """
+        if self.paused_targets:
+            return
+        if not running:
+            self.step(self.clock)
+            return
+        if self.detour is not None:
+            start,end,elapsed=self.detour
+            elapsed+=dt
+            if elapsed<GUIDE_RETREAT:
+                self.detour=(start,end,elapsed)
+                fraction=elapsed/GUIDE_RETREAT
+                self.blend(start,end,fraction*fraction*(3-2*fraction))
+                return
+            self.detour=None
+            self.clock=end-SOURCE_POSE
+        if self.holds and self.clock+dt>=self.holds[0][0]:
+            hold,seat,axle=self.holds[0]
+            self.clock=hold
+            if finished(axle):
+                self.holds.pop(0)
+                self.detour=(SOURCE_POSE+hold,SOURCE_POSE+seat+GUIDE_EXIT,0.)
+                self.sample=None
+                return
+            self.step(self.clock)
+            return
+        self.clock+=dt
+        self.step(self.clock)
 
 
 class Carrier:
@@ -860,7 +989,9 @@ class Cell:
         cube(stage,ROOT+"/CN7/Body",(0,0,1.55),(4.56,1.57,.36))
         sections=collision_web(stage)
         mats=(material(stage,"Steel",.27),material(stage,"Rubber",.82),material(stage,"RollerGrip",.62),
-              material(stage,"GripPad",PAD_STATIC_FRICTION,PAD_DYNAMIC_FRICTION,combine="min"))
+              material(stage,"GripPad",PAD_STATIC_FRICTION,PAD_DYNAMIC_FRICTION,combine="min"),
+              # Cradle support rollers are free idlers; model their rolling resistance only.
+              material(stage,"IdlerRoller",.02,.02,combine="min"))
         for ax in (-1,1):
             for side in (-1,1):
                 pad=cube(stage,f"{ROOT}/DockLift/LoadPad_{ax+1}_{side+1}",(ax*1.65,side*.40,.927),
@@ -934,7 +1065,9 @@ class Cell:
             staged_sides={station.side for station in self.stations if station.tip_handoff}
             for robot in self.robots:
                 side=1 if "Left" in robot.path else -1
-                robot.step(task_time if side in staged_sides else 0.)
+                done=lambda axle,side=side:all(station.phase in TERMINAL_PHASES for station in self.stations
+                                                if station.side==side and station.name[0]==axle)
+                robot.advance(4*dt,side in staged_sides and self.dock_ready_time is not None,done)
         self.robot_clearance()
         for station in self.stations:
             old=station.phase
@@ -964,6 +1097,9 @@ class Cell:
                 robot=pair[0] or pair[1]
                 first=header.contact_data_offset
                 if any(contacts[i].separation<-.001 for i in range(first,first+header.num_contact_data)):
+                    if os.environ.get("CELL_DEBUG"):
+                        print("CONTACTDBG",round(self.seconds,3),collider0,collider1,
+                              min(contacts[i].separation for i in range(first,first+header.num_contact_data)),flush=True)
                     self.stop_pair(*self.pair_by_robot[robot.path],"equipment_contact")
             for face,other in ((collider0,collider1),(collider1,collider0)):
                 if face.startswith(self.carrier.path+"/Support_") and other in (ROOT+"/Floor","/World/Factory/DockPlate"):
@@ -974,8 +1110,12 @@ class Cell:
                 if station and other.startswith(station.wheel+"/Web_"):
                     station.face_contact=True
                     station.face_contact_now=True
+                if os.environ.get("CELL_DEBUG") and "/Shuttle" in face and round(self.seconds*HZ)%240==0:
+                    print("SHUTTLEDBG",round(self.seconds,2),face,other,flush=True)
                 parent=other.rsplit("/",1)[0]
                 unit=self.by_wheel.get(parent)
+                if unit and os.environ.get("CELL_DEBUG") and unit.phase=="insert" and round(self.seconds*HZ)%120==0:
+                    print("INSERTDBG",round(self.seconds,2),unit.name,round(unit.gap,4),round(unit.press.Get(),4),face,other,flush=True)
                 if unit:
                     if unit.phase in ("clamp","tip_up") and face in unit.transfer.pads:
                         pad_force=0.

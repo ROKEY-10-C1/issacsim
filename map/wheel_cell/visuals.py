@@ -13,10 +13,10 @@ CONCRETE = (.26, .267, .27)
 ALLOY = (.62, .64, .67)
 BRUSHED = (.30, .306, .312)
 ZINC = (.48, .49, .50)
-PAINT = (.097, .106, .117)
+PAINT = (.80, .81, .83)          # silver-white body, as in the layout image
 GLASS = (.014, .018, .022)
 PANEL = (.61, .615, .61)
-ROBOT_YELLOW = (.82,.57,.027)
+ROBOT_YELLOW = (.88,.42,.03)    # orange robot powder coat
 
 FINISHES = {
     RUBBER: ("Rubber", 0., .78),
@@ -98,8 +98,14 @@ class VisualAssets:
         library = UsdGeom.Xform.Define(stage, LIB)
         library.CreateVisibilityAttr("invisible")
         self.stage = stage
+        bundled = Path(__file__).resolve().parent/"assets"
         robot_file = robot_file or root/"M0609/robot/m0609_rg2_d455_edit.usd"
         tire_file = root/"Factory/CN7/tire_example/tire_example.usd"
+        # Fall back to meshes recovered from an earlier build when the isaacpjt tree is absent.
+        if not robot_file.is_file():
+            robot_file = bundled/"d455_tool.usda"
+        if not tire_file.is_file():
+            tire_file = bundled/"tire_example.usda"
         missing = [file for file in (robot_file, tire_file) if not file.is_file()]
         if missing:
             raise FileNotFoundError(f"Set --asset-root to isaacpjt. Missing: {missing}")
@@ -167,6 +173,9 @@ class VisualAssets:
                 and "collisions" not in prim.GetPath().pathString.split("/"))
 
     def robot_tools(self, source, cache):
+        if source.GetDefaultPrim().GetName() == "D455":
+            self.cached_tools(source)
+            return
         robot = source.GetDefaultPrim().GetPath()
         flange = source.GetPrimAtPath(robot.AppendChild("link_6"))
         origin = cache.GetLocalToWorldTransform(flange).GetInverse()
@@ -190,6 +199,18 @@ class VisualAssets:
             camera.MakeMatrixXform().Set(transform)
         if not tools.GetPrim().GetChildren():
             raise ValueError("The tool source USD must contain the D455 bracket and exterior meshes")
+
+    def cached_tools(self, source):
+        UsdGeom.Xform.Define(self.stage, LIB+"/D455")
+        for part in source.GetDefaultPrim().GetChildren():
+            path = f"{LIB}/D455/{part.GetName()}"
+            if part.IsA(UsdGeom.Camera):
+                camera = UsdGeom.Camera.Define(self.stage, path)
+                camera.SetFromCamera(UsdGeom.Camera(part).GetCamera())
+                continue
+            colors = UsdGeom.Gprim(part).GetDisplayColorAttr().Get()
+            rgb = tuple(round(c, 3) for c in colors[0]) if colors else BRUSHED
+            copy_mesh(self.stage, path, part, Gf.Matrix4d(1), GLASS if rgb == GLASS else BRUSHED)
 
     def tire_instance(self, path, wheel, damaged):
         name = f"{LIB}/Tire_{wheel.inches}" + ("_Rejected" if damaged else "")

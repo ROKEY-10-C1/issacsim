@@ -27,7 +27,7 @@ def stop(process):
 def main():
     root = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", type=Path, default=root/"output/wheel_cell.usdc")
+    parser.add_argument("--stage", type=Path, default=root.parent/"scene"/"wheel_cell.usda")
     parser.add_argument("--budget-gib", type=int, choices=range(1, 9), default=8,
                         metavar="1..8")
     cameras = parser.add_mutually_exclusive_group()

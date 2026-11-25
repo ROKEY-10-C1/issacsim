@@ -253,7 +253,7 @@ def write_concrete(path):
     base=rng.standard_normal((768,768))
     mottling=gaussian_filter(base,16,mode="wrap")
     grit=gaussian_filter(base,1.2,mode="wrap")
-    shade=138+5*mottling/mottling.std()+2.3*grit/grit.std()+1.5*base
+    shade=184+5*mottling/mottling.std()+2.3*grit/grit.std()+1.5*base  # light gray epoxy-sealed slab
     rgb=np.stack((shade+1,shade,shade-1),axis=-1)
     Image.fromarray(np.clip(rgb,0,255).astype(np.uint8)).save(path,optimize=True)
 
@@ -271,10 +271,20 @@ def factory(stage):
     arrow_points=[(-2.62,0.,.004),(-3.06,.20,.004),(-3.06,.071,.004),
                   (-3.52,.071,.004),(-3.52,-.071,.004),(-3.06,-.071,.004),(-3.06,-.20,.004)]
     mesh(stage,path+"/DockDirection",arrow_points,[3,4],[0,1,6,2,3,4,5],(.04,.54,.78),True)
+    cell_floor=(.36,.43,.52)  # inside-cell tint from the layout legend; the dock plate stays dark
+    for name,(x0,x1,y0,y1) in (("Left",(-4.52,5.65,1.11,2.36)),("Right",(-4.52,5.65,-2.36,-1.11)),
+                               ("Entry",(-4.52,-2.475,-1.11,1.11)),("Exit",(2.475,5.65,-1.11,1.11))):
+        box(stage,path+f"/CellFloor_{name}",((x0+x1)/2,(y0+y1)/2,.0015),(x1-x0,y1-y0,.002),cell_floor)
     for side,label in ((1,"Left"),(-1,"Right")):
         for i in range(10):
             box(stage,path+f"/AMR_{label}_{i}",(AMR_GATE_X,side*(.24+i*.48),.005),
                 (.044,.26,.005),(.04,.54,.78))
+        # AMR loop between the buffers and the cell entry, dashed as in the layout image.
+        for i in range(4):
+            box(stage,path+f"/AMR_{label}Loop_{i}",(AMR_GATE_X+.30+i*.48,side*4.92,.005),
+                (.26,.044,.005),(.04,.54,.78))
+        tip=[(-4.62,side*4.92,.006),(-4.98,side*4.92+.20,.006),(-4.98,side*4.92-.20,.006)]
+        mesh(stage,path+f"/AMR_{label}LoopArrow",tip,[3],[0,1,2],(.04,.54,.78),True)
         parking(stage,path+f"/{label}VehicleBuffer",side)
         rail(stage,path+f"/{label}Rail",side)
         guard_end=REJECT_X-.40 if side>0 else 4.95
@@ -329,9 +339,9 @@ def factory(stage):
             cam.CreateVerticalApertureAttr(157.5)
         cam.CreateFocalLengthAttr(focal)
     light=UsdLux.DomeLight.Define(stage,"/World/Fill")
-    light.CreateIntensityAttr(95)
+    light.CreateIntensityAttr(260)
     sun=UsdLux.DistantLight.Define(stage,"/World/Ambient")
-    sun.CreateIntensityAttr(220)
+    sun.CreateIntensityAttr(420)
     sun.AddRotateXYZOp().Set(Gf.Vec3f(35,-23,0))
     for side,tag in ((1,"Left"),(-1,"Right")):
         for axle,kind in ((AXLE,"Front"),(-AXLE,"Rear")):
@@ -754,7 +764,10 @@ def order(stage, assets, mount_arm, fasten_arm, data, record):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path(__file__).parent/"output")
+    parser.add_argument("--output", type=Path, default=Path(__file__).parent/"output",
+                        help="Folder for build intermediates and the physics setup export")
+    parser.add_argument("--scene", type=Path, default=Path(__file__).resolve().parent.parent/"scene",
+                        help="Layered scene folder; overrides/ inside it is never overwritten")
     parser.add_argument("--inject-defect", action="store_true", help="Reject and replace first FL wheel")
     parser.add_argument("--mount-urdf", type=Path, default=DOOSAN_ASSETS/"h2515.urdf")
     parser.add_argument("--fasten-urdf", "--urdf", type=Path, default=DOOSAN_ASSETS/"m1509.urdf")
@@ -809,13 +822,18 @@ def main():
     usd = args.output/"wheel_cell.usdc"
     if not stage.GetRootLayer().Export(str(usd)):
         raise OSError(f"Could not export {usd}")
-    db = args.output/"production.sqlite3"
+    # The scene is delivered as a root layer with one sublayer per area; the
+    # monolithic file is only the intermediate the split is made from.
+    from split_scene import split
+    usd_root, parts = split(usd, args.scene)
+    usd.unlink()
+    db = args.scene/"production.sqlite3"
     with sqlite3.connect(db) as connection:
         connection.execute("CREATE TABLE IF NOT EXISTS events ("
                            "sim_s REAL, vehicle TEXT, station TEXT, code TEXT, detail TEXT)")
         connection.execute("DELETE FROM events")
         connection.executemany("INSERT INTO events VALUES (?, ?, ?, ?, ?)", sorted(events))
-    print(f"{usd} ({data[-1]:.1f}s), {db} ({len(events)} events)")
+    print(f"{usd_root} ({len(parts)} layers, {data[-1]:.1f}s), {db} ({len(events)} events)")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,10 @@ from process import BELT_Z, CN7_R16, LINE_Y, REJECT_GATE_HALF, REJECT_X
 FACTORY="/World/Factory"
 START_AHEAD=.76
 TREAD_HALF=.095
+PARK_X=-.07       # TipCenter travel is -.08 to .49 m from the axle
+PARK_Y=.24
+PARK_Z=-.20
+PARK_TIME=4.0
 
 
 def collider(prim, material=None):
@@ -190,8 +194,8 @@ class Transfer:
                 return False
             self.close_start=seconds
         closing=progress(seconds,self.close_start,.49)
-        for attr,direction in zip(self.jaws,(-1,1)):
-            attr.Set(-direction*JAW_STROKE*closing)
+        for attr in self.jaws:
+            attr.Set(JAW_STROKE*closing)
         return closing>=.90
 
     def capture(self,api,wheel):
@@ -244,20 +248,21 @@ class Transfer:
         self.return_time=0.
 
     def park(self,dt):
-        if self.return_time is None or self.return_time>=4.75:
+        if self.return_time is None or self.return_time>=PARK_TIME:
             return
         self.return_time+=dt
-        # Withdraw away from the spindle before swinging the open jaw beam.
+        # Stay upright and tuck beside the axle, below the robot tool and outboard of the
+        # wheel path: the mount robot's rail carriage later occupies axle+0.53 m, where the
+        # flat jaw beam used to park and was pushed back between the wheel and the hub.
         outbound=progress(self.return_time,.80,.75)
-        raised=progress(self.return_time,1.55,.50)
-        retreat=progress(self.return_time,2.10,.85)
-        straighten=progress(self.return_time,3.05,.95)
-        lower=progress(self.return_time,4.05,.65)
-        parked_y=self.side*(LINE_Y+.24)
-        point=self.return_start+Gf.Vec3d(
-            (self.origin[0]+.46-self.return_start[0])*retreat,
-            (parked_y-self.return_start[1])*outbound,
-            (self.origin[2]+.25-self.return_start[2])*raised)
-        parked=Gf.Vec3d(self.origin[0]+.46,parked_y,self.origin[2])
-        self.position_target(point*(1-lower)+parked*lower)
-        self.axes[3].Set(self.angular_goal*(1-straighten))
+        retreat=progress(self.return_time,1.60,.85)
+        lower=progress(self.return_time,2.50,.80)
+        parked=Gf.Vec3d(self.origin[0]+PARK_X,self.side*(LINE_Y+PARK_Y),self.origin[2]+PARK_Z)
+        start=self.return_start
+        self.position_target(Gf.Vec3d(start[0]+(parked[0]-start[0])*retreat,
+                                      start[1]+(parked[1]-start[1])*outbound,
+                                      start[2]+(parked[2]-start[2])*lower))
+        self.axes[3].Set(self.angular_goal)
+        if self.return_time>3.4:
+            for attr in self.jaws:
+                attr.Set(JAW_STROKE)

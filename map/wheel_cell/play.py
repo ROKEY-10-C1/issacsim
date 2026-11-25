@@ -106,7 +106,7 @@ def play(app, args):
         viewport.set_texture_resolution(QUALITY[args.quality][:2])
     physics_setup=bool(stage.GetPrimAtPath("/World/Live/Physics"))
     if physics_setup and (args.jam or args.seed is not None):
-        raise ValueError("Use wheel_cell.usdc for live control with --seed or --jam.")
+        raise ValueError("Use scene/wheel_cell.usda for live control with --seed or --jam.")
     if physics_setup and args.start_at:
         raise ValueError("Start the physical stage at time zero so the AMR can follow the inbound route.")
     if not args.replay and not physics_setup:
