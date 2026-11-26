@@ -106,7 +106,7 @@ def play(app, args):
         viewport.set_texture_resolution(QUALITY[args.quality][:2])
     physics_setup=bool(stage.GetPrimAtPath("/World/Live/Physics"))
     if physics_setup and (args.jam or args.seed is not None):
-        raise ValueError("Use wheel_cell.usdc for live control with --seed or --jam.")
+        raise ValueError("Use scene/wheel_cell.usda for live control with --seed or --jam.")
     if physics_setup and args.start_at:
         raise ValueError("Start the physical stage at time zero so the AMR can follow the inbound route.")
     if not args.replay and not physics_setup:
@@ -166,8 +166,10 @@ def main():
     from isaacsim import SimulationApp
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("stage", type=Path)
-    parser.add_argument("smoke_frames", type=int)
+    parser.add_argument("stage", type=Path, nargs="?",
+                        default=Path(__file__).resolve().parent.parent/"scene"/"wheel_cell.usda")
+    parser.add_argument("smoke_frames", type=int, nargs="?", default=0,
+                        help="Render N updates headless, then exit (0 = open the window)")
     parser.add_argument("--camera", choices=("Overview", "Assembly", "WheelDetail", "HubDetail", "TopView"), default="Overview")
     parser.add_argument("--start-at", type=float, default=0.)
     parser.add_argument("--quality", choices=QUALITY, default="high")
@@ -175,6 +177,7 @@ def main():
     parser.add_argument("--seed", type=int)
     parser.add_argument("--jam", action="store_true")
     args = parser.parse_args()
+    args.stage = args.stage.resolve()
     width, height, renderer = QUALITY[args.quality]
     path_tracing = renderer == "PathTracing"
     app = SimulationApp({"headless": bool(args.smoke_frames), "multi_gpu": False,
