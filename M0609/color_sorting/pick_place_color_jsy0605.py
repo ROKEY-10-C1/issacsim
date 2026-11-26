@@ -1,8 +1,8 @@
 """M0609 손목 카메라와 ROS 2를 사용하는 색상 분류 시뮬레이션.
 
 PC A (Isaac Sim): source ~/isaacsim/setup_ros_env.sh
-                  ROS_DOMAIN_ID=50 ~/isaacsim/python.sh pick_place_color.py
-PC B (검출기): ROS_DOMAIN_ID=50, /rgb (Image) 구독, /color_id (Int32) 발행.
+                  ROS_DOMAIN_ID=101 ~/isaacsim/python.sh pick_place_color_jsy0605.py
+PC B (검출기): 같은 ROS_DOMAIN_ID에서 /rgb (Image) 구독, /color_id (Int32) 발행.
 """
 
 import os
@@ -22,6 +22,7 @@ simulation_app = SimulationApp({"headless": False})
 # 2. Isaac 모듈 import (앱을 켠 뒤에)
 # ============================================================
 import numpy as np
+import omni.graph.core as og
 import omni.kit.commands
 from isaacsim.core.api import World
 from isaacsim.core.api.controllers import BaseController
@@ -33,7 +34,6 @@ from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.robot.manipulators.grippers import ParallelGripper
 from isaacsim.robot.manipulators.manipulators import SingleManipulator
 
-from isaacsim.sensors.camera import Camera
 from pxr import Gf, Usd, UsdGeom
 
 ROBOT_PRIM = "/World/m0609_rg2_d455"
@@ -51,6 +51,7 @@ PLACE_TARGETS = {
     2: (45, (0.3235, 0.31883, 0.02575)),
 }
 CAMERA_WIDTH, CAMERA_HEIGHT = 640, 480
+ROS_GRAPH_PATH = "/World/Graph/PickPlaceROS"
 CAMERA_SETTLE_FRAMES = 15
 IMAGE_INTERVAL_FRAMES = 6
 CUBE_SIZE = 0.0515                               # 큐브 한 변 (m)
@@ -268,9 +269,11 @@ def aim_camera(camera_prim, point):
 
 
 def run():
+    # Isaac Sim에 번들된 ROS 2 Python 모듈을 사용할 수 있게 한다.
     enable_extension("isaacsim.ros2.bridge")
 
     import rclpy
+    from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
     from rclpy.qos import QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import Image
     from std_msgs.msg import Int32
@@ -295,9 +298,39 @@ def run():
     camera.initialize()
 
     node = None
+    executor = None
+    ros_thread = None
+    mailbox_lock = Lock()
+    pending_frame = None
+    pending_color = None
 
     def on_color(message):
-        controller.select_color(message.data)
+        nonlocal pending_color
+        if message.data in PLACE_TARGETS:
+            with mailbox_lock:
+                pending_color = message.data
+
+    def publish_frame():
+        nonlocal pending_frame
+        with mailbox_lock:
+            frame, pending_frame = pending_frame, None
+        if frame is None:
+            return
+        rgba, stamp = frame
+        image = Image()
+        image.header.stamp = stamp
+        image.header.frame_id = "d455_color_optical_frame"
+        image.height, image.width = rgba.shape[:2]
+        image.encoding = "rgb8"
+        image.step = image.width * 3
+        image.data = rgba[:, :, :3].tobytes()
+        image_publisher.publish(image)
+
+    def spin_ros():
+        try:
+            executor.spin()
+        except ExternalShutdownException:
+            pass
 
     rclpy.init()
     try:
@@ -305,18 +338,25 @@ def run():
         image_publisher = node.create_publisher(Image, "/rgb", 1)
         color_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
         node.create_subscription(Int32, "/color_id", on_color, color_qos)
+        frame_ready = node.create_guard_condition(publish_frame)
+        executor = SingleThreadedExecutor()
+        executor.add_node(node)
+        ros_thread = Thread(target=spin_ros, name="m0609-ros")
+        ros_thread.start()
         print(f"ROS_DOMAIN_ID={os.environ['ROS_DOMAIN_ID']} | /rgb → PC B | /color_id ← PC B")
 
         reset_needed = False
         detection_frames = 0
         first_step_logged = False
-        while simulation_app.is_running() and rclpy.ok():
+        while simulation_app.is_running() and rclpy.ok() and ros_thread.is_alive():
             world.step(render=True)
             if world.is_stopped():
                 reset_needed = True
             if not world.is_playing():
                 controller.accepting_color = False
-                rclpy.spin_once(node, timeout_sec=0)
+                with mailbox_lock:
+                    pending_frame = None
+                    pending_color = None
                 continue
 
             if reset_needed:
@@ -331,7 +371,10 @@ def run():
                 print(f"{world.current_time:5.2f} s | [1/{len(STEPS)}] {STEPS[0][0]} 시작")
                 first_step_logged = True
             last_step = controller.step
-            rclpy.spin_once(node, timeout_sec=0)
+            with mailbox_lock:
+                color_id, pending_color = pending_color, None
+            if color_id is not None:
+                controller.select_color(color_id)
             observations = world.get_observations()
             cube_position = observations[cube_name]["position"]
 
@@ -343,15 +386,13 @@ def run():
                         and (detection_frames - CAMERA_SETTLE_FRAMES) % IMAGE_INTERVAL_FRAMES == 0):
                     rgba = camera.get_rgba(device="cpu")
                     if rgba is not None and rgba.shape == (CAMERA_HEIGHT, CAMERA_WIDTH, 4):
-                        rgb = rgba[:, :, :3]
-                        image = Image()
-                        image.header.stamp = node.get_clock().now().to_msg()
-                        image.header.frame_id = "d455_color_optical_frame"
-                        image.height, image.width = rgb.shape[:2]
-                        image.encoding = "rgb8"
-                        image.step = image.width * 3
-                        image.data = rgb.tobytes()
-                        image_publisher.publish(image)
+                        # 카메라 버퍼는 다음 렌더에서 재사용될 수 있다.
+                        frame = rgba.copy(), node.get_clock().now().to_msg()
+                        with mailbox_lock:
+                            if not controller.accepting_color:
+                                pending_color = None
+                            pending_frame = frame
+                        frame_ready.trigger()
                         if not controller.accepting_color:
                             print("[ROS] /rgb 발행 중. /color_id 1 또는 2 대기")
                         controller.accepting_color = True
@@ -369,6 +410,10 @@ def run():
             if controller.is_done() and last_step < controller.step:
                 print(f"분류 완료. 큐브 중심 위치 {cube_position.round(5)} m")
     finally:
+        if executor is not None:
+            executor.shutdown()
+        if ros_thread is not None and ros_thread.ident is not None:
+            ros_thread.join()
         if node is not None:
             node.destroy_node()
         rclpy.try_shutdown()
