@@ -45,8 +45,8 @@ from fitment import (
 )
 from physical_data import AMR_SIZE, AMR_WHEEL_RADIUS, DOCK_CLAMP_CLOSED, DOCK_CLAMP_OPEN, ROLLER_RADIUS
 from process import (
-    AMR_BAY_Y, AMR_GATE_X, AXLE, BELT_Z, CN7_R16, CROSS, FASTEN_PARK, FEED, FPS,
-    HUB_Z, LINE_Y, MOUNT_PARK, NUT_CYCLE, NUT_DRIVE, NUT_ENGAGE, NUT_PICKUP,
+    AMR_BAY_Y, AMR_GATE_X, AXLE, BELT_Z, CN7_R16, FASTEN_PARK, FEED, FPS,
+    HUB_Z, LINE_Y, MOUNT_PARK, NUT_CYCLE, NUT_DRIVE, NUT_ENGAGE, NUT_FINAL, NUT_PICKUP,
     RAIL_Y, REJECT_GATE_HALF, REJECT_X, STATIONS, bend, schedule,
 )
 from wheel_geometry import barrel, center_web, hub as make_hub, nut as make_nut, wheelhouse
@@ -63,6 +63,9 @@ TEAL = (.08, .58, .43)
 TOOL = .20
 DOOSAN_ASSETS = Path(__file__).parent/"assets"
 NUT_ADVANCE = 5*PITCH
+# Flange frame of the fastening tool (see Arm.solve): x = world x, y = world z * side, so
+# stud k at hub angle a sits at (PCD/2 cos a, -PCD/2 sin a) on either side of the car.
+SOCKET_LAYOUT = tuple((PCD/2*cos(a), -PCD/2*sin(a)) for a in BOLT_ANGLES)
 
 
 def frame(seconds):
@@ -594,11 +597,15 @@ def robot_model(stage, root, side, arm, mounting):
         for j in (-1,1):
             box(stage,flange+f"/GuideJaw_{j+1}",(j*.025,0,.142),(.024,.037,.070),ALLOY)
     else:
-        cylinder(stage,flange+"/Nutrunner",(0,0,.070),.037,.14,BRUSHED)
-        for i in range(5):
-            ring(stage,flange+f"/DriveFins_{i}",(0,0,.026+i*.014),.041,.033,.003,ALLOY)
-        cylinder(stage,flange+"/GearHead",(0,0,.131),.026,.050,BRUSHED)
-        cylinder(stage,flange+"/Socket",(0,0,.177),.016,.046,AMBER)
+        # Five-spindle head on the PCD: socket tips at TOOL, laid out in the flange frame so
+        # that with the fixed approach orientation each socket lands on its own stud.
+        cylinder(stage,flange+"/Nutrunner",(0,0,.060),.037,.12,BRUSHED)
+        for i in range(4):
+            ring(stage,flange+f"/DriveFins_{i}",(0,0,.022+i*.014),.041,.033,.003,ALLOY)
+        cylinder(stage,flange+"/GearHead",(0,0,.132),.088,.024,BRUSHED)
+        for i,(sx,sy) in enumerate(SOCKET_LAYOUT):
+            cylinder(stage,flange+f"/Nutrunner_Spindle_{i}",(sx,sy,.152),.011,.018,ALLOY)
+            cylinder(stage,flange+f"/Socket_{i}",(sx,sy,.180),.016,.040,AMBER)
     return groups
 
 
@@ -606,10 +613,10 @@ def magazine(stage, path, side):
     pocket=(.30,side*1.23,1.135)
     px,py,pz=pocket
     box(stage,path+"/Stand",(px,py-side*.095,.715),(.098,.10,.77),BRUSHED)
-    box(stage,path+"/Cassette",(px,py-side*.065,pz+.044),(.097,.11,.18),PANEL)
-    cylinder(stage,path+"/Outlet",(px,py-side*.018,pz),.023,.041,BRUSHED,"Y")
-    for i in range(4):
-        box(stage,path+f"/Rib_{i}",(px,py-side*.007,pz+.037+i*.028),(.078,.012,.008),RUBBER)
+    # Nut presenter: five outlets on the stud pattern, filled for one wheel per pick.
+    box(stage,path+"/Cassette",(px,py-side*.065,pz),(.17,.11,.17),PANEL)
+    for i,(sx,sy) in enumerate(SOCKET_LAYOUT):
+        cylinder(stage,path+f"/Outlet_{i}",(px+sx,py-side*.018,pz+side*sy),.020,.041,BRUSHED,"Y")
     return np.array(pocket)+(0.,side*TOOL,0.)
 
 
@@ -664,29 +671,28 @@ def rail_robot(stage, root, arm, side, start, front, rear, rear_tight, front_tig
     else:
         offset=-.53
         rail_samples=((start,FASTEN_PARK),(rear_tight-3,FASTEN_PARK),(rear_tight,-AXLE+offset),
-                      (rear_tight+len(CROSS)*NUT_CYCLE+1,-AXLE+offset),
+                      (rear_tight+NUT_CYCLE+1,-AXLE+offset),
                       (front_tight-1,AXLE+offset),
-                      (front_tight+len(CROSS)*NUT_CYCLE+1,AXLE+offset),(departure,FASTEN_PARK))
+                      (front_tight+NUT_CYCLE+1,AXLE+offset),(departure,FASTEN_PARK))
         pickup=magazine(stage,root+"/NutMagazine",side)
         poses=[(start,safe)]
         for first,axle in ((rear_tight,-AXLE),(front_tight,AXLE)):
-            poses.append((first,safe))
-            for step,index in enumerate(CROSS):
-                a=BOLT_ANGLES[index]
-                t=first+step*NUT_CYCLE
-                px,pz=-offset+PCD/2*cos(a),HUB_Z-side*PCD/2*sin(a)
-                outside=half_track(axle)+NUT_SEAT+NUT_LENGTH+NUT_ADVANCE+TOOL
-                waypoint=(px,side*(outside+.08),pz)
-                poses.extend(((t+NUT_PICKUP,pickup),(t+1.94,waypoint),
-                              (t+NUT_ENGAGE,(px,side*outside,pz)),
-                              (t+NUT_ENGAGE+NUT_DRIVE,(px,side*(outside-NUT_ADVANCE),pz)),
-                              (t+NUT_CYCLE,waypoint)))
-                held_root=root+f"/Joint_6/CarriedNut_{round(first*1000)}_{step}"
-                held,_=xform(stage,held_root,(0.,0.,TOOL+NUT_LENGTH))
+            # The head is centred on the hub axis; all five sockets engage and run down together.
+            px,pz=-offset,HUB_Z
+            outside=half_track(axle)+NUT_SEAT+NUT_LENGTH+NUT_ADVANCE+TOOL
+            waypoint=(px,side*(outside+.08),pz)
+            run_down=(px,side*(outside-NUT_ADVANCE),pz)
+            poses.extend(((first,safe),(first+NUT_PICKUP,pickup),(first+1.94,waypoint),
+                          (first+NUT_ENGAGE,(px,side*outside,pz)),
+                          (first+NUT_ENGAGE+NUT_DRIVE,run_down),
+                          (first+NUT_ENGAGE+NUT_DRIVE+NUT_FINAL,run_down),
+                          (first+NUT_CYCLE,waypoint),(first+NUT_CYCLE+1,safe)))
+            for k,(sx,sy) in enumerate(SOCKET_LAYOUT):
+                held_root=root+f"/Joint_6/CarriedNut_{round(first*1000)}_{k}"
+                held,_=xform(stage,held_root,(sx,sy,TOOL+NUT_LENGTH))
                 held.AddRotateXOp().Set(180.)
                 make_nut(stage,held_root)
-                visibility(held,t+NUT_PICKUP,t+NUT_ENGAGE)
-            poses.append((first+len(CROSS)*NUT_CYCLE+1,safe))
+                visibility(held,first+NUT_PICKUP,first+NUT_ENGAGE)
     for t,x in rail_samples:
         move(slide,t,(x,0,0))
     key_robot(stage,arm,groups,side,poses,root)
@@ -769,27 +775,27 @@ def order(stage, assets, mount_arm, fasten_arm, data, record):
                          (seated-2.,x+.012,y,HUB_Z+.01-roller),
                          (seated-1.,x,y,HUB_Z-roller),
                          (seated,x,wheel_y,HUB_Z-roller),
-                         (tight+len(CROSS)*NUT_CYCLE,x,wheel_y,HUB_Z-roller),
-                         (tight+len(CROSS)*NUT_CYCLE+1,x,wheel_y,.45),
-                         (tight+len(CROSS)*NUT_CYCLE+2,x,y,.45)):
+                         (tight+NUT_CYCLE,x,wheel_y,HUB_Z-roller),
+                         (tight+NUT_CYCLE+1,x,wheel_y,.45),
+                         (tight+NUT_CYCLE+2,x,y,.45)):
             move(carriage,t,(cx,cy,z))
         record(path[-1][0],vehicle,name,"inspect","Simulated wheel inspection")
         record(seated-1,vehicle,name,"aligned",
                f"Nominal static envelope: pilot clearance {fit(wheel)['pilot_m']*1000:.2f} mm radial")
         record(seated,vehicle,name,"seated","Nominal alignment, wheel retained by load support")
-        for step,index in enumerate(CROSS):
-            bx,by=BOLT_CENTERS[index]
+        t=tight+NUT_ENGAGE
+        for index,(bx,by) in enumerate(BOLT_CENTERS):
             nut_root=root+f"/Carrier/Hanger/{name}/Nut_{index}"
             nut,nut_pos=xform(stage,nut_root)
             nut_spin=nut.AddRotateZOp()
-            t=tight+step*NUT_CYCLE+NUT_ENGAGE
             visibility(nut,t,end)
             make_nut(stage,nut_root)
-            for seconds,distance,spin_angle in ((t,NUT_ADVANCE,0.),(t+NUT_DRIVE,0.,1800.)):
+            for seconds,distance,spin_angle in ((t,NUT_ADVANCE,0.),(t+NUT_DRIVE,0.,1800.),
+                                                (t+NUT_DRIVE+NUT_FINAL,0.,1830.)):
                 move(nut_pos,seconds,(bx,by,NUT_SEAT+distance))
                 nut_spin.Set(spin_angle,frame(seconds))
-            record(t+NUT_DRIVE,vehicle,name,"tightened",f"Nut {index+1}; virtual {DEMO_TORQUE:.0f} N m (accept {NUT_TORQUE[0]}–{NUT_TORQUE[1]})")
-        record(tight+len(CROSS)*NUT_CYCLE+2,vehicle,name,"complete","Five nuts, support withdrawn")
+            record(t+NUT_DRIVE+NUT_FINAL,vehicle,name,"tightened",f"Nut {index+1}; virtual {DEMO_TORQUE:.0f} N m (accept {NUT_TORQUE[0]}–{NUT_TORQUE[1]})")
+        record(tight+NUT_CYCLE+2,vehicle,name,"complete","Five nuts in one multi-spindle cycle, support withdrawn")
 
 
 def main():

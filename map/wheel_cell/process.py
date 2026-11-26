@@ -6,11 +6,12 @@ from fitment import WHEELBASE
 
 FPS = 24
 HUB_Z = 0.94
-CROSS = (0, 2, 4, 1, 3)
-NUT_CYCLE = 3.9
+# Five-spindle nutrunner: one pick of all five nuts, one simultaneous run-down per wheel.
 NUT_PICKUP = .90
 NUT_ENGAGE = 2.45
 NUT_DRIVE = .75
+NUT_FINAL = .60                    # synchronized final-torque step after run-down
+NUT_CYCLE = NUT_ENGAGE+NUT_DRIVE+NUT_FINAL+.70
 AXLE = WHEELBASE/2
 STATIONS = {"FL": (AXLE, 1), "FR": (AXLE, -1),
             "RL": (-AXLE, 1), "RR": (-AXLE, -1)}
@@ -90,8 +91,8 @@ def schedule(inject, mixed_sizes=False):
         front_seat = ready+6.
         rear_seat = front_seat+9.
         rear_tighten = rear_seat+5.
-        front_tighten = rear_tighten+len(CROSS)*NUT_CYCLE+7.
-        departure = front_tighten+len(CROSS)*NUT_CYCLE+8.
+        front_tighten = rear_tighten+NUT_CYCLE+7.
+        departure = front_tighten+NUT_CYCLE+8.
         end = departure+19.
         yield number, wheel, start, deliveries, reject, front_seat, rear_seat, rear_tighten, front_tighten, departure, end
         start = end+1.
