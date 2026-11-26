@@ -1,8 +1,8 @@
 /*
 !/.gitignore
-!/isaacpjt/
-/isaacpjt/*
-!/isaacpjt/M0609/
-/isaacpjt/M0609/*
-!/isaacpjt/M0609/basic/
-!/isaacpjt/M0609/m609_color_detection.py
+!/README.md
+!/M0609/
+/M0609/*
+!/M0609/basic/
+!/M0609/color_sorting/
+!/M0609/m609_color_detection.py
