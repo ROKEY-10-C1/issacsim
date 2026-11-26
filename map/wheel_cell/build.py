@@ -61,6 +61,12 @@ WHITE = (.72, .77, .79)
 RED = (.73, .10, .08)
 TEAL = (.08, .58, .43)
 TOOL = .20
+# Plant layout outside the cell: fence at CELL_Y, walkway, buffer guard, buffers, outer guard, wall.
+CELL_Y = 2.36
+BUFFER_GUARD_Y = AMR_BAY_Y-2.65
+OUTER_GUARD_Y = AMR_BAY_Y+2.65
+HALL_Y = OUTER_GUARD_Y+.40
+FLOOR_Y = HALL_Y+.40
 DOOSAN_ASSETS = Path(__file__).parent/"assets"
 NUT_ADVANCE = 5*PITCH
 # Flange frame of the fastening tool (see Arm.solve): x = world x, y = world z * side, so
@@ -237,7 +243,7 @@ def rail(stage, root, side):
 
 
 def parking(stage, root, side):
-    bay_y=side*4.92
+    bay_y=side*AMR_BAY_Y
     marker=(.06,.53,.74)
     for i,x in enumerate((-3.12,0.,3.12)):
         box(stage,root+f"/Line_{i}_a",(x-.99,bay_y,.004),(.032,4.98,.004),marker)
@@ -257,11 +263,11 @@ def parking(stage, root, side):
 
 
 def concrete_floor(stage, path):
-    box(stage,path+"/Slab",(0,0,-.108),(20,15,.2),CONCRETE)
-    floor=mesh(stage,path+"/Concrete", [(-10,-7.5,0),(10,-7.5,0),(10,7.5,0),(-10,7.5,0)],
+    box(stage,path+"/Slab",(0,0,-.108),(20,2*FLOOR_Y,.2),CONCRETE)
+    floor=mesh(stage,path+"/Concrete", [(-10,-FLOOR_Y,0),(10,-FLOOR_Y,0),(10,FLOOR_Y,0),(-10,FLOOR_Y,0)],
                [4],[0,1,2,3],CONCRETE)
     uv=UsdGeom.PrimvarsAPI(floor).CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray,"vertex")
-    uv.Set([(0.,0.),(5.,0.),(5.,3.75),(0.,3.75)])
+    uv.Set([(0.,0.),(5.,0.),(5.,FLOOR_Y/2),(0.,FLOOR_Y/2)])
     shader=UsdShade.Shader.Get(stage,"/Looks/Concrete/Surface")
     coords=UsdShade.Shader.Define(stage,"/Looks/Concrete/UV")
     coords.CreateIdAttr("UsdPrimvarReader_float2")
@@ -295,9 +301,10 @@ def factory(stage):
     path="/World/Factory"
     concrete_floor(stage,path)
     for i in range(1,8):
-        box(stage,path+f"/FloorJoint_{i}",(-10+i*2.5,0,.001),(.007,14.95,.002),(.17,.19,.20))
-    for j in range(-2,3):
-        box(stage,path+f"/TransverseJoint_{j+2}",(0,j*2.5,.001),(19.96,.007,.002),(.17,.19,.20))
+        box(stage,path+f"/FloorJoint_{i}",(-10+i*2.5,0,.001),(.007,2*FLOOR_Y-.05,.002),(.17,.19,.20))
+    joints=int(FLOOR_Y//2.5)
+    for j in range(-joints,joints+1):
+        box(stage,path+f"/TransverseJoint_{j+joints}",(0,j*2.5,.001),(19.96,.007,.002),(.17,.19,.20))
     box(stage,path+"/DockPlate",(0,0,-.012),(4.95,2.22,.024),(.15,.18,.20))
     for i in range(9):
         box(stage,path+f"/AMR_Center_{i}",(-6.53+i*.48,0,.003),(.265,.045,.005),(.04,.54,.78))
@@ -309,14 +316,14 @@ def factory(stage):
                                ("Entry",(-4.52,-2.475,-1.11,1.11)),("Exit",(2.475,5.65,-1.11,1.11))):
         box(stage,path+f"/CellFloor_{name}",((x0+x1)/2,(y0+y1)/2,.0015),(x1-x0,y1-y0,.002),cell_floor)
     for side,label in ((1,"Left"),(-1,"Right")):
-        for i in range(10):
+        for i in range(int((AMR_BAY_Y-.24)/.48)+1):
             box(stage,path+f"/AMR_{label}_{i}",(AMR_GATE_X,side*(.24+i*.48),.005),
                 (.044,.26,.005),(.04,.54,.78))
         # AMR loop between the buffers and the cell entry, dashed as in the layout image.
         for i in range(4):
-            box(stage,path+f"/AMR_{label}Loop_{i}",(AMR_GATE_X+.30+i*.48,side*4.92,.005),
+            box(stage,path+f"/AMR_{label}Loop_{i}",(AMR_GATE_X+.30+i*.48,side*AMR_BAY_Y,.005),
                 (.26,.044,.005),(.04,.54,.78))
-        tip=[(-4.62,side*4.92,.006),(-4.98,side*4.92+.20,.006),(-4.98,side*4.92-.20,.006)]
+        tip=[(-4.62,side*AMR_BAY_Y,.006),(-4.98,side*AMR_BAY_Y+.20,.006),(-4.98,side*AMR_BAY_Y-.20,.006)]
         mesh(stage,path+f"/AMR_{label}LoopArrow",tip,[3],[0,1,2],(.04,.54,.78),True)
         parking(stage,path+f"/{label}VehicleBuffer",side)
         rail(stage,path+f"/{label}Rail",side)
@@ -324,8 +331,12 @@ def factory(stage):
         fence(stage,path+f"/{label}InnerGuard",(-4.52,side*2.36),(guard_end,side*2.36))
         if side>0:
             fence(stage,path+"/RejectGuard",(REJECT_X+.40,2.36),(4.95,2.36))
-        fence(stage,path+f"/{label}OuterGuard",(-5.55,side*7.32),(6.10,side*7.32))
-        fence(stage,path+f"/{label}EndGuard",(5.65,side*2.38),(5.65,side*7.32))
+        # Walkway between the cell fence and the vehicle buffer, as in the layout image.
+        fence(stage,path+f"/{label}BufferGuard",(-4.52,side*BUFFER_GUARD_Y),(4.95,side*BUFFER_GUARD_Y))
+        for k,y in enumerate((CELL_Y+.18,BUFFER_GUARD_Y-.18)):
+            box(stage,path+f"/CellFloor_{label}Walkway_{k}",(.215,side*y,.004),(9.47,.06,.003),AMBER)
+        fence(stage,path+f"/{label}OuterGuard",(-5.55,side*OUTER_GUARD_Y),(6.10,side*OUTER_GUARD_Y))
+        fence(stage,path+f"/{label}EndGuard",(5.65,side*2.38),(5.65,side*OUTER_GUARD_Y))
         belt(stage,label+"AxleTransfer",(-1.04,side*LINE_Y),(1.04,side*LINE_Y),.67)
         if side>0:
             reject_gate=belt(stage,label+"Feed",(1.68,side*LINE_Y),bend(side)[-1],.67,outlet_x=REJECT_X)
@@ -358,7 +369,7 @@ def factory(stage):
         box(stage,path+f"/TruckBay_{i}",(6.55+i*.23,5.81,.006),(.121,.089,.007),AMBER)
     industrial_hall(stage,path)
     for name,eye,target,focal in (
-            ("Overview",(-14.8,0.,14.0),(.65,0.,.44),20.8),
+            ("Overview",(-17.6,0.,16.6),(.65,0.,.44),20.8),
             ("Assembly",(-6.0,-4.35,3.34),(.18,0.,1.0),26),
             ("WheelDetail",(2.37,2.76,1.95),(1.40,1.13,.82),30),
             ("HubDetail",(1.94,2.13,1.53),(AXLE,.81,.97),48),
@@ -368,8 +379,8 @@ def factory(stage):
         cam.AddTransformOp().Set(Gf.Matrix4d().SetLookAt(vector(eye),vector(target),up).GetInverse())
         if name=="TopView":
             cam.CreateProjectionAttr("orthographic")
-            cam.CreateHorizontalApertureAttr(280.)
-            cam.CreateVerticalApertureAttr(157.5)
+            cam.CreateHorizontalApertureAttr(16/9*(2*FLOOR_Y+.6)*10)
+            cam.CreateVerticalApertureAttr((2*FLOOR_Y+.6)*10)
         cam.CreateFocalLengthAttr(focal)
     light=UsdLux.DomeLight.Define(stage,"/World/Fill")
     light.CreateIntensityAttr(260)
@@ -397,31 +408,36 @@ def industrial_hall(stage, root):
     wall = (.51, .55, .58)
     for i in range(4):
         center = -7.5+i*5
-        box(stage, root+f"/WallBase_{i}", (center, 7.43, .59), (4.98, .16, 1.18), CONCRETE)
-        box(stage, root+f"/Cladding_{i}", (center, 7.46, 2.20), (4.98, .12, 2.1), wall)
-        box(stage, root+f"/Clerestory_{i}", (center, 7.45, 3.83), (4.75, .11, 1.12), GLASS)
+        box(stage, root+f"/WallBase_{i}", (center, HALL_Y, .59), (4.98, .16, 1.18), CONCRETE)
+        box(stage, root+f"/Cladding_{i}", (center, HALL_Y+.03, 2.20), (4.98, .12, 2.1), wall)
+        box(stage, root+f"/Clerestory_{i}", (center, HALL_Y+.02, 3.83), (4.75, .11, 1.12), GLASS)
         for j in range(5):
-            box(stage, root+f"/Mullion_{i}_{j}", (center-2+j, 7.38, 3.83), (.047, .09, 1.11), BRUSHED)
-        box(stage, root+f"/UpperCladding_{i}", (center, 7.46, 4.77), (4.98, .12, .74), wall)
-    for i, y in enumerate((-4.15, -.10, 3.92)):
-        box(stage, root+f"/EndWall_{i}", (9.94, y, 2.45), (.12, 3.92, 4.9), wall)
+            box(stage, root+f"/Mullion_{i}_{j}", (center-2+j, HALL_Y-.05, 3.83), (.047, .09, 1.11), BRUSHED)
+        box(stage, root+f"/UpperCladding_{i}", (center, HALL_Y+.03, 4.77), (4.98, .12, .74), wall)
+    # End wall from the open front edge to the side wall, in equal bays.
+    bays = 4
+    y0, y1 = -FLOOR_Y+.5, HALL_Y
+    width = (y1-y0)/bays
+    for i in range(bays):
+        y = y0+(i+.5)*width
+        box(stage, root+f"/EndWall_{i}", (9.94, y, 2.45), (.12, width-.02, 4.9), wall)
         for j in range(2):
-            box(stage, root+f"/EndWindow_{i}_{j}", (9.86, y+(j-.5)*1.52, 3.73),
-                (.035, 1.47, .86), GLASS)
-    for i, y in enumerate((-5.60, -2.15, 1.91)):
-        box(stage, root+f"/EndUpright_{i}", (9.82, y, 2.45), (.16, .17, 4.9), BRUSHED)
+            box(stage, root+f"/EndWindow_{i}_{j}", (9.86, y+(j-.5)*width*.39, 3.73),
+                (.035, width*.37, .86), GLASS)
+    for i in range(bays-1):
+        box(stage, root+f"/EndUpright_{i}", (9.82, y0+(i+1)*width, 2.45), (.16, .17, 4.9), BRUSHED)
     for i, x in enumerate((-9.8, -5., 0., 5., 9.8)):
-        box(stage, root+f"/Column_{i}", (x, 7.17, 2.61), (.28, .24, 5.2), BRUSHED)
-        box(stage, root+f"/ColumnFoot_{i}", (x, 7.17, .10), (.43, .37, .20), ZINC)
-        box(stage, root+f"/RoofBeam_{i}", (x, 6.91, 5.13), (.16, 1.24, .24), BRUSHED)
-        for j, y in enumerate((-1.65, 3.65)):
+        box(stage, root+f"/Column_{i}", (x, HALL_Y-.26, 2.61), (.28, .24, 5.2), BRUSHED)
+        box(stage, root+f"/ColumnFoot_{i}", (x, HALL_Y-.26, .10), (.43, .37, .20), ZINC)
+        box(stage, root+f"/RoofBeam_{i}", (x, HALL_Y-.52, 5.13), (.16, 1.24, .24), BRUSHED)
+        for j, y in enumerate((-AMR_BAY_Y, -1.65, 1.65, AMR_BAY_Y)):
             fixture = f"/World/Lighting/Strip_{i}_{j}"
             rect = UsdLux.RectLight.Define(stage, fixture)
             rect.AddTranslateOp().Set(Gf.Vec3d(x, y, 4.789))
             rect.CreateWidthAttr(1.92)
             rect.CreateHeightAttr(.19)
             rect.CreateIntensityAttr(650 if i in (1, 2, 3) else 380)
-    box(stage,root+"/RoofEdge",(0.,7.04,5.16),(19.75,.16,.23),BRUSHED)
+    box(stage,root+"/RoofEdge",(0.,HALL_Y-.39,5.16),(19.75,.16,.23),BRUSHED)
     for i, x in enumerate((5.90, 6.62, 7.34, 8.05)):
         cabinet = root+f"/Panel_{i}"
         box(stage, cabinet+"/Housing", (x, -4.88, .96), (.66, .52, 1.86), PANEL)

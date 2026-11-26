@@ -24,7 +24,7 @@ REJECT_GATE_HALF = .365
 BELT_Z = .50
 SPEED = .30
 AMR_GATE_X = -7.0
-AMR_BAY_Y = 4.95
+AMR_BAY_Y = 6.55                  # vehicle buffer centre line, 1.5 m aisle outside the cell fence
 MOUNT_PARK = 3.15
 FASTEN_PARK = -3.15
 
