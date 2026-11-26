@@ -651,11 +651,22 @@ def key_robot(stage, arm, groups, side, waypoints, root):
 
     previous_t,first=waypoints[0]
     # Start H2515 on the same folded-elbow branch as the insertion targets.
-    seed=np.deg2rad([side*17,0,-143,-side*76,80,-side*54]) if arm.model=="h2515" else None
-    previous=arm.solve(base,first,side,seed)
+    seed=np.deg2rad([17,0,-143,-76,80,-54]) if arm.model=="h2515" else None
+    left_base=(base[0],abs(base[1]),base[2])
+    mirrored=lambda p:(p[0],-p[1],p[2])
+
+    def solve(target,previous,reference):
+        # Solve the left arm, then give the right arm the mirror image of that posture so
+        # both sides sweep the same envelope past the parked tip fixtures.
+        left=arm.solve(left_base,mirrored(target) if side<0 else target,1,reference)
+        if side>0:
+            return left,left
+        return left,arm.solve_mirrored(base,target,left,previous)
+
+    reference,previous=solve(first,None,seed)
     pose(previous_t,previous)
     for seconds,target in waypoints[1:]:
-        q=arm.solve(base,target,side,previous)
+        reference,q=solve(target,previous,reference)
         duration=seconds-previous_t
         if np.any(abs(q-previous)>arm.speed*duration):
             raise ValueError(f"Joint speed limit exceeded at {root}, {seconds:.2f}s; required {max(abs(q-previous)/arm.speed):.2f}s, planned {duration:.2f}s")

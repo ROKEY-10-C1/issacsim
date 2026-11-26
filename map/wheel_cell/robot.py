@@ -31,12 +31,13 @@ class Arm:
             frames.append((p, rot, axis_world))
         return frames
 
-    def solve(self, base, target, side, previous=None):
+    def solve(self, base, target, side, previous=None, fallback=True):
         # Flange +Z points from the flange toward the wheel.
         rotation = np.array([[1, 0, 0], [0, 0, -side], [0, side, 0]])
         seeds = [previous] if previous is not None else []
         rng = np.random.default_rng(41)
-        seeds += [np.zeros(6), *rng.uniform(-2.4, 2.4, (24, 6))]
+        if fallback:
+            seeds += [np.zeros(6), *rng.uniform(-2.4, 2.4, (24, 6))]
         for seed in seeds:
             q = seed.copy()
             for _ in range(100):
@@ -51,4 +52,28 @@ class Arm:
                 error = np.r_[position, .3 * orientation]
                 step = jacobian.T @ np.linalg.solve(jacobian @ jacobian.T + .0004 * np.eye(6), error)
                 q = np.clip(q + np.clip(step, -.25, .25), self.lower, self.upper)
+        if not fallback:
+            return None
         raise ValueError(f"{self.model.upper()} target unreachable at {target} from {base}")
+
+    def solve_mirrored(self, base, target, reference, previous=None):
+        """Right-side (side=-1) solution whose links mirror a left-side reference posture.
+
+        The URDF is not mirror-symmetric (joint 2 has a y offset), so no sign pattern maps a
+        left posture onto the right; IK alone may then land on another wrist branch. Try the
+        previous right posture and every sign pattern of the reference, keep the closest mirror.
+        """
+        mirror = np.diag([1, -1, 1])
+        wanted = [mirror @ p for p, _, _ in self.fk((base[0], -base[1], base[2]), reference)]
+        seeds = [] if previous is None else [previous]
+        seeds += [reference*np.array(signs) for signs in np.ndindex(*(2,)*6)
+                  for signs in [tuple(1-2*s for s in signs)]]
+        best, score = None, None
+        for seed in seeds:
+            q = self.solve(base, target, -1, np.clip(seed, self.lower, self.upper), fallback=False)
+            if q is None:
+                continue
+            error = sum(np.linalg.norm(p-w) for (p, _, _), w in zip(self.fk(base, q), wanted))
+            if score is None or error < score:
+                best, score = q, error
+        return best if best is not None else self.solve(base, target, -1, previous)
