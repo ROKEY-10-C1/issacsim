@@ -24,6 +24,13 @@ REJECT_GATE_HALF = .365
 BELT_Z = .50
 SPEED = .30
 AMR_GATE_X = -7.0
+# AMR legs timed to KUKA KMP 1500 limits (crab 0.56 m/s, straight 1.0 m/s) with ~10 % margin,
+# plus the 0.05 m/s lift: buffer -> gate (crab), gate -> dock (straight), lift 0.12 m.
+AMR_AT_GATE = 13.
+AMR_DOCKED = AMR_AT_GATE+8.
+AMR_LIFTED = AMR_DOCKED+3.
+AMR_OUT_GATE = 10.                 # dock -> gate after departure; gate -> outbound buffer follows
+AMR_OUT_BUFFER = 13.
 AMR_BAY_Y = 6.55                  # vehicle buffer centre line, 1.5 m aisle outside the cell fence
 MOUNT_PARK = 3.15
 FASTEN_PARK = -3.15
@@ -93,6 +100,6 @@ def schedule(inject, mixed_sizes=False):
         rear_tighten = rear_seat+5.
         front_tighten = rear_tighten+NUT_CYCLE+7.
         departure = front_tighten+NUT_CYCLE+8.
-        end = departure+19.
+        end = departure+AMR_OUT_GATE+AMR_OUT_BUFFER
         yield number, wheel, start, deliveries, reject, front_seat, rear_seat, rear_tighten, front_tighten, departure, end
         start = end+1.

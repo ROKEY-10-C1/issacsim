@@ -45,7 +45,7 @@ from fitment import (
 )
 from physical_data import AMR_SIZE, AMR_WHEEL_RADIUS, DOCK_CLAMP_CLOSED, DOCK_CLAMP_OPEN, ROLLER_RADIUS
 from process import (
-    AMR_BAY_Y, AMR_GATE_X, AXLE, BELT_Z, CN7_R16, FASTEN_PARK, FEED, FPS,
+    AMR_AT_GATE, AMR_BAY_Y, AMR_DOCKED, AMR_GATE_X, AMR_LIFTED, AMR_OUT_GATE, AXLE, BELT_Z, CN7_R16, FASTEN_PARK, FEED, FPS,
     HUB_Z, LINE_Y, MOUNT_PARK, NUT_CYCLE, NUT_DRIVE, NUT_ENGAGE, NUT_FINAL, NUT_PICKUP,
     RAIL_Y, REJECT_GATE_HALF, REJECT_X, STATIONS, bend, schedule,
 )
@@ -724,7 +724,7 @@ def dock_clamps(stage, root, start, departure):
             box(stage,path+"/Slide/Jaw",(0,0,.22),(.13,.057,.105),AMBER)
             box(stage,path+"/Slide/Pad",(0,-side*.032,.22),(.09,.016,.074),ALLOY)
             cylinder(stage,path+"/Slide/Pin",(0,side*.055,.22),.020,.086,ZINC,"Y")
-            for t,y in ((start,DOCK_CLAMP_OPEN),(start+16,DOCK_CLAMP_OPEN),(start+18,DOCK_CLAMP_CLOSED),
+            for t,y in ((start,DOCK_CLAMP_OPEN),(start+AMR_DOCKED,DOCK_CLAMP_OPEN),(start+AMR_DOCKED+2,DOCK_CLAMP_CLOSED),
                         (departure-2,DOCK_CLAMP_CLOSED),(departure,DOCK_CLAMP_OPEN)):
                 move(slide,t,(x,side*y,0))
 
@@ -737,15 +737,15 @@ def order(stage, assets, mount_arm, fasten_arm, data, record):
     visibility(cycle,start,end)
     amr,lift=carrier(stage,assets,root+"/Carrier")
     dock_clamps(stage,root,start,departure)
-    route=((start,AMR_GATE_X,AMR_BAY_Y),(start+7,AMR_GATE_X,0.),(start+16,0.,0.),
-           (departure,0.,0.),(departure+10,AMR_GATE_X,0.),(end,AMR_GATE_X,-AMR_BAY_Y))
+    route=((start,AMR_GATE_X,AMR_BAY_Y),(start+AMR_AT_GATE,AMR_GATE_X,0.),(start+AMR_DOCKED,0.,0.),
+           (departure,0.,0.),(departure+AMR_OUT_GATE,AMR_GATE_X,0.),(end,AMR_GATE_X,-AMR_BAY_Y))
     for t,x,y in route:
         move(amr,t,(x,y,0.))
-    for t,height in ((start,-.12),(start+16,-.12),(start+19,0.),
-                     (departure+10,0.),(end,-.10)):
+    for t,height in ((start,-.12),(start+AMR_DOCKED,-.12),(start+AMR_LIFTED,0.),
+                     (departure+AMR_OUT_GATE,0.),(end,-.10)):
         move(lift,t,(0.,0.,height))
     record(start,vehicle,"","order",wheel.name)
-    record(start+19,vehicle,"","docked","AMR dock and lift complete")
+    record(start+AMR_LIFTED,vehicle,"","docked","AMR dock and lift complete")
     record(departure,vehicle,"","depart","Both rails parked")
     record(end,vehicle,"","outbound","AMR reached outbound apron")
     for side,name in ((1,"Left"),(-1,"Right")):

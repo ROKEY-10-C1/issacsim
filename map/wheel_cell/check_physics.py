@@ -17,7 +17,7 @@ sys.path.insert(0, str(root))
 from physical_data import AMR_LIFT_SPEED, AMR_SPEED_X, AMR_SPEED_Y, WHEEL_MASS
 from physics import Cell, DOCK_READY, HZ, MIN_RAIL_SPACING, ROOT, SOURCE_POSE, STATIONS
 from physics import constrain, pose, qfloat, quaternion, reference, rotate
-from process import BELT_Z, LINE_Y
+from process import AMR_BAY_Y, AMR_GATE_X, BELT_Z, LINE_Y
 
 
 def check_actors(stage, robots, exported=False):
@@ -123,7 +123,7 @@ def check(path, seed, jam, robots, rail_probe, export, interference_probe, tip_d
         front_left=cell.stations[0]
         car_path=ROOT+"/CN7"
         car=stage.GetPrimAtPath(car_path)
-        if dist(UsdGeom.Xformable(car).GetLocalTransformation().ExtractTranslation(),(-7.,4.95,-.12))>.001:
+        if dist(UsdGeom.Xformable(car).GetLocalTransformation().ExtractTranslation(),(AMR_GATE_X,AMR_BAY_Y,-.12))>.001:
             return False
         previous_deck=None
         previous_lift=None
